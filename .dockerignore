@@ -1,0 +1,6 @@
+bin/
+data/
+*.exe
+.env
+.git
+.DS_Store

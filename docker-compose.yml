@@ -1,0 +1,146 @@
+services:
+  # ============================================================================
+  # Relational Database for Metadata Storage
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: storage_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-storage_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-storage_secret}
+      POSTGRES_DB: ${DB_NAME:-storage_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/000001_init_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-storage_user} -d ${DB_NAME:-storage_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - storage-net
+
+  # ============================================================================
+  # Central Coordinator / API Gateway
+  # ============================================================================
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    container_name: storage_coordinator
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - COORDINATOR_PORT=8080
+      - COORDINATOR_HOST=0.0.0.0
+      - ENVIRONMENT=development
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=${DB_USER:-storage_user}
+      - DB_PASSWORD=${DB_PASSWORD:-storage_secret}
+      - DB_NAME=${DB_NAME:-storage_db}
+      - DB_SSLMODE=disable
+      - JWT_SECRET=${JWT_SECRET:-super-secret-jwt-key-change-in-production-min-32-chars}
+      - JWT_EXPIRATION_HOURS=24
+      - WEIGHT_STORAGE=0.35
+      - WEIGHT_CPU=0.20
+      - WEIGHT_RAM=0.15
+      - WEIGHT_LATENCY=0.15
+      - WEIGHT_HEALTH=0.15
+      - DEFAULT_REPLICATION_FACTOR=3
+      - MIN_REPLICATION_FACTOR=2
+      - MAX_REPLICATION_FACTOR=5
+      - HEARTBEAT_INTERVAL_SECONDS=5
+      - HEARTBEAT_TIMEOUT_SECONDS=15
+      - SELF_HEALING_INTERVAL_SECONDS=10
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - storage-net
+
+  # ============================================================================
+  # Independent Storage Nodes (Fleet of 3)
+  # ============================================================================
+  storage-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: storage_node_1
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    environment:
+      - NODE_HOSTNAME=storage-node-1
+      - NODE_PORT=9001
+      - NODE_STORAGE_PATH=/data/chunks
+      - NODE_CAPACITY_BYTES=10737418240 # 10GB
+      - NODE_COORDINATOR_URL=http://coordinator:8080
+      - HEARTBEAT_INTERVAL_SECONDS=5
+    volumes:
+      - storage_data_1:/data/chunks
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    networks:
+      - storage-net
+
+  storage-node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: storage_node_2
+    restart: unless-stopped
+    ports:
+      - "9002:9001"
+    environment:
+      - NODE_HOSTNAME=storage-node-2
+      - NODE_PORT=9001
+      - NODE_STORAGE_PATH=/data/chunks
+      - NODE_CAPACITY_BYTES=10737418240 # 10GB
+      - NODE_COORDINATOR_URL=http://coordinator:8080
+      - HEARTBEAT_INTERVAL_SECONDS=5
+    volumes:
+      - storage_data_2:/data/chunks
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    networks:
+      - storage-net
+
+  storage-node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    container_name: storage_node_3
+    restart: unless-stopped
+    ports:
+      - "9003:9001"
+    environment:
+      - NODE_HOSTNAME=storage-node-3
+      - NODE_PORT=9001
+      - NODE_STORAGE_PATH=/data/chunks
+      - NODE_CAPACITY_BYTES=10737418240 # 10GB
+      - NODE_COORDINATOR_URL=http://coordinator:8080
+      - HEARTBEAT_INTERVAL_SECONDS=5
+    volumes:
+      - storage_data_3:/data/chunks
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    networks:
+      - storage-net
+
+volumes:
+  postgres_data:
+  storage_data_1:
+  storage_data_2:
+  storage_data_3:
+
+networks:
+  storage-net:
+    driver: bridge
