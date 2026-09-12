@@ -89,8 +89,8 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [ ] 2.2 Storage Node Service - Go service with internal APIs (store, get, delete, verify), heartbeats
 - [ ] 2.3 Placement Engine - Multi-metric weighted scoring, exclusion thresholds, $N$-node ranking
 - [ ] 2.4 Replication Manager - Adaptive replication, HOT/WARM/COLD classification
-- [ ] 2.5 Heartbeat & Failure Detection - Periodic heartbeats, timeout handling, audit logging
-- [ ] 2.6 Self-Healing System - Automatic replica recovery on node failure with atomic updates
+- [x] 2.5 Heartbeat & Failure Detection - Periodic heartbeats, timeout handling, audit logging
+- [x] 2.6 Self-Healing System - Automatic replica recovery on node failure with atomic updates
 
 ### Phase 3: API Endpoints
 - [ ] 3.1 Authentication APIs - register, login, validate
@@ -343,3 +343,99 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 ---
 
 ## Current Phase: Phase 2: Core Services (Phase 1 Completed)
+
+### Completed Sub-Phases
+- [x] **2.5** Heartbeat & Failure Detection — verified 6/6 tests pass
+- [x] **2.6** Self-Healing System — verified 9/9 tests pass
+
+### Remaining Sub-Phases
+- [ ] 2.1 Authentication Service
+- [ ] 2.2 Storage Node Service (internal verify endpoint)
+- [ ] 2.3 Placement Engine
+- [ ] 2.4 Replication Manager (HOT/WARM/COLD adaptive replication)
+
+---
+
+## Codebase File Reference
+
+> Quick guide for teammates — what every file does, what it owns, and what to touch when you need to change something.
+
+---
+
+### `cmd/` — Binary Entry Points
+
+These are the `main` packages that compile into the two runnable binaries. **Do not put business logic here** — wire things together and delegate to `pkg/`.
+
+|         File              |      Binary        |                            What it does                                        |
+| `cmd/coordinator/main.go` |  `coordinator.exe` | Boots the coordinator service: loads config, connects to Postgres, runs DB migrations, starts the failure-detector goroutine, registers all HTTP routes (auth, objects, metadata, monitoring), and starts the Gin server. |
+| `cmd/storage-node/main.go`| `storage-node.exe` | Boots a storage node: loads config, creates the local storage directory, registers the internal storage HTTP routes (`/internal/storage/...`), and starts the background heartbeat sender that pings the coordinator. |
+
+---
+
+### `pkg/types/` — Shared Type Definitions
+
+| File | What it does |
+| `pkg/types/types.go` | **The single source of truth for all shared data structures.** Defines every Go struct (`User`, `StorageNode`, `Object`, `Replica`, `AccessLog`, `SystemLog`, `HeartbeatPayload`, `StandardResponse`, `ObjectMetadataWithReplicas`, `ReplicaLocation`) and every constant (`NodeStatus`, `ReplicaStatus`, `LogSeverity`, error codes like `ErrCodeObjectNotFound`). **If you add a new field to the DB schema or a new API response shape, start here.** |
+
+---
+
+### `pkg/database/` — Data Access Layer (Repository Pattern)
+
+All database interaction lives here. Every file follows the same pattern: a `struct` that holds a `*DB` handle, a constructor (`New*Repository`), and typed query methods. **Never write raw SQL outside this package.**
+
+| File | What it owns | Key functions |
+| `pkg/database/postgres.go` | DB connection, connection pool config, schema migrations | `Connect()` — opens a Postgres connection pool with retry logic (10 attempts, 2s backoff, for Docker startup race). `RunMigrationsUp()` — applies the full schema (tries the migrations folder first, falls back to an embedded SQL constant). `CheckSchema()` — verifies all 6 required tables exist. Also contains the embedded fallback SQL schema as a Go `const`. |
+| `pkg/database/node_repository.go` | `storage_nodes` table | `UpsertNode()` — inserts a new node or refreshes its metrics on heartbeat (keyed by hostname, so a restarted container doesn't create a duplicate). `UpdateHeartbeat()` — updates metrics only, does NOT touch status. `MarkNodeOffline()` — called by the failure detector when a node misses its heartbeat deadline. `GetAllNodes()`, `GetOnlineNodes()`, `GetOfflineNodes()`, `GetNodeByID()`. |
+| `pkg/database/object_repository.go` | `objects` table | `GetObjectByID()` — fetches full object metadata by UUID. This is intentionally minimal right now; upload/delete methods will be added in Phase 3. |
+| `pkg/database/replica_repository.go` | `replicas` table | `GetReplicasByNode()`, `GetReplicasByObject()` — general lookups. `GetHealthyReplicasByObject()` — joins with `storage_nodes` to only return replicas on ONLINE nodes (used by self-healing as copy-source candidates). `InsertReplica()` / `InsertReplicaTx()` — creates a new replica in `RECOVERING` state. `UpdateReplicaStatus()` / `UpdateReplicaStatusTx()` — transitions status. `MarkReplicaLost()` / `MarkReplicaLostTx()` — convenience wrappers. `Tx` variants exist for atomic multi-step operations in self-healing. |
+| `pkg/database/log_repository.go` | `system_logs` table | `InsertSystemLog()` — writes a structured audit event with event type, description, severity level (`DEBUG`/`INFO`/`WARN`/`ERROR`/`CRITICAL`), and optional JSONB metadata. Called by the failure detector and self-healing engine to produce an audit trail. |
+
+---
+
+### `pkg/coordinator/` — Coordinator Business Logic
+
+The core distributed-systems intelligence lives here. These files are used **only** by the coordinator binary.
+
+| File | What it does | Key details |
+|---|---|---|
+| `pkg/coordinator/placement.go` | **Intelligent node selection for object placement.** Scores every ONLINE node using a weighted formula across storage availability, CPU usage, memory usage, and network latency. Filters out nodes that are offline, full, or overloaded beyond configurable thresholds. Returns the top-N ranked nodes for replica placement. | Weights and thresholds are read from config, not hardcoded. This is what gets called during object upload to decide which nodes receive replicas. |
+| `pkg/coordinator/placement_test.go` | Unit tests for the placement engine. | Tests cover: healthy node selection, offline node exclusion, low-storage exclusion, overloaded-node avoidance, and score ranking. |
+| `pkg/coordinator/failure_detector.go` | **Heartbeat-based failure detection.** Runs as a background goroutine on the coordinator. Periodically queries all nodes from the DB and marks any node whose `last_heartbeat` is older than the configured timeout as `OFFLINE`. Writes a `system_log` entry for each detected failure and triggers the self-healing engine. | The check interval and timeout threshold are configurable via env vars. This is the only place that calls `MarkNodeOffline()`. |
+| `pkg/coordinator/failure_detector_test.go` | Unit tests for failure detection. | Tests cover: fresh node not marked offline, stale node correctly marked offline, already-offline node idempotency. |
+| `pkg/coordinator/self_healing.go` | **Automatic replica recovery engine.** When called (by the failure detector on node failure), it finds all objects that had replicas on the failed node, marks those replicas as `LOST`, finds a healthy source replica, calls the placement engine to select a new destination node, copies the object data via internal HTTP APIs, and atomically updates the replica record to `HEALTHY`. All metadata changes happen inside a DB transaction. | This is the most complex file in the project. It coordinates across the DB, the placement engine, and live HTTP calls to storage nodes. Verify checksums are validated post-copy. |
+| `pkg/coordinator/self_healing_test.go` | Unit tests for self-healing. | 9 test cases covering: replica recovery, source selection, destination placement, checksum verification, partial failure rollback, and concurrent recovery safety. |
+
+---
+
+### `pkg/node/` — Storage Node Business Logic
+
+Logic that runs **only** on the storage node binary.
+
+| File | What it does | Key details |
+|---|---|---|
+| `pkg/node/storage_handler.go` | **Internal HTTP handlers for raw object data.** Implements `POST /internal/storage/store` (write file to disk), `GET /internal/storage/:id` (stream file to caller), and `DELETE /internal/storage/:id` (remove file). UUIDs are validated on every route to prevent path-traversal attacks. Files are stored flat in the configured `storagePath` directory, named by their object UUID. | Only the coordinator should call these routes. They are internal APIs, not exposed to end users. |
+| `pkg/node/storage_handler_test.go` | Unit tests for the storage handler. | Tests cover: store + retrieve round-trip, delete, missing object 404, invalid UUID rejection. |
+| `pkg/node/heartbeat_sender.go` | **Periodic telemetry reporter.** Runs as a background goroutine on each storage node. Every configurable interval, it collects real system metrics (disk usage, CPU, memory, latency) and POSTs a `HeartbeatPayload` JSON to the coordinator's heartbeat endpoint. | This is what keeps a node "alive" in the coordinator's view. If this stops sending, the failure detector will eventually mark the node OFFLINE. |
+
+---
+
+### `pkg/config/` — Configuration System
+
+| File | What it does |
+|---|---|
+| `pkg/config/` (all files) | Loads and validates all configuration from environment variables. Provides strongly-typed config structs for the DB connection, heartbeat intervals, placement weights/thresholds, storage paths, and JWT secrets. **All tunable values (timeouts, thresholds, weights, node addresses) must be read from here — never hardcoded.** |
+
+---
+
+### Root-Level Files
+
+| File | What it does |
+|---|---|
+| `docker-compose.yml` | Defines all services: coordinator, postgres, storage-node-1/2/3, and (eventually) the React frontend. Each storage node gets its own named Docker volume for independent persistent storage. |
+| `Dockerfile.coordinator` | Multi-stage build for the coordinator binary. |
+| `Dockerfile.node` | Multi-stage build for the storage-node binary. |
+| `migrations/` | SQL migration files for the Postgres schema. `000001_init_schema.up.sql` creates all 6 tables. `000001_init_schema.down.sql` drops them. |
+| `.env` | **Local development secrets and config** (not committed to production). Copy from `.env.example` when setting up. |
+| `.env.example` | Template showing all required environment variables with safe placeholder values. |
+| `go.mod` / `go.sum` | Go module definition and dependency lock file. |
+| `PROGRESS_TRACKING.md` | This file. Project context, phase plan, requirements checklist, and file reference guide. |
