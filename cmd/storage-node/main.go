@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"distributed-storage/pkg/config"
+	"distributed-storage/pkg/node"
 	"distributed-storage/pkg/types"
 
 	"github.com/gin-gonic/gin"
@@ -75,6 +76,12 @@ func main() {
 		})
 	})
 
+	// -------------------------------------------------------------------------
+	// Phase 2.6: Internal storage APIs (used by self-healing engine for replica copy)
+	// -------------------------------------------------------------------------
+	storageHandler := node.NewStorageHandler(cfg.StoragePath)
+	storageHandler.RegisterRoutes(router)
+
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("0.0.0.0:%d", cfg.Port),
 		Handler:      router,
@@ -89,11 +96,20 @@ func main() {
 		}
 	}()
 
+	// -------------------------------------------------------------------------
+	// Phase 2.5: Heartbeat sender — runs in its own goroutine
+	// -------------------------------------------------------------------------
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	heartbeatSender := node.NewHeartbeatSender(cfg)
+	go heartbeatSender.Run(bgCtx)
+
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Printf("[SHUTDOWN] Shutting down storage node [%s]...", cfg.Hostname)
+
+	bgCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
