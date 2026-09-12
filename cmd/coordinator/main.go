@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"distributed-storage/pkg/config"
+	"distributed-storage/pkg/coordinator"
 	"distributed-storage/pkg/database"
 	"distributed-storage/pkg/types"
 
@@ -48,7 +49,16 @@ func main() {
 		log.Fatalf("[FATAL] Schema verification failed: %v", err)
 	}
 
-	// 3. Initialize HTTP Router
+	// 3. Initialize Repositories
+	nodeRepo := database.NewNodeRepository(db)
+	replicaRepo := database.NewReplicaRepository(db)
+	objectRepo := database.NewObjectRepository(db)
+	logRepo := database.NewLogRepository(db)
+
+	// 4. Initialize Placement Engine (used by self-healing)
+	placementEngine := coordinator.NewPlacementEngine(nodeRepo, cfg.Placement)
+
+	// 5. Initialize HTTP Router
 	router := gin.Default()
 
 	// CORS Middleware
@@ -100,7 +110,43 @@ func main() {
 		})
 	})
 
-	// 4. Start HTTP Server with Graceful Shutdown
+	// -------------------------------------------------------------------------
+	// Phase 2.5: Heartbeat receiver endpoint
+	// Storage nodes POST their periodic metrics here.
+	// -------------------------------------------------------------------------
+	router.POST("/internal/heartbeat", func(c *gin.Context) {
+		var payload types.HeartbeatPayload
+		if err := c.ShouldBindJSON(&payload); err != nil {
+			c.JSON(http.StatusBadRequest, types.StandardResponse{
+				Success:   false,
+				Message:   "invalid heartbeat payload: " + err.Error(),
+				ErrorCode: types.ErrCodeValidationFailed,
+			})
+			return
+		}
+
+		if err := nodeRepo.UpsertNode(payload); err != nil {
+			log.Printf("[HEARTBEAT] ERROR upserting node %s: %v", payload.Hostname, err)
+			c.JSON(http.StatusInternalServerError, types.StandardResponse{
+				Success:   false,
+				Message:   "failed to record heartbeat",
+				ErrorCode: types.ErrCodeMetadataFailure,
+			})
+			return
+		}
+
+		log.Printf("[HEARTBEAT] Received from %s (%s) — used=%d/%d bytes, cpu=%.1f%%, mem=%.1f%%",
+			payload.Hostname, payload.NodeID,
+			payload.UsedStorage, payload.TotalStorage,
+			payload.CPUUsage, payload.MemoryUsage)
+
+		c.JSON(http.StatusOK, types.StandardResponse{
+			Success: true,
+			Message: "Heartbeat recorded",
+		})
+	})
+
+	// 6. Start HTTP Server with Graceful Shutdown
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		Handler:      router,
@@ -115,11 +161,32 @@ func main() {
 		}
 	}()
 
+	// -------------------------------------------------------------------------
+	// Phase 2.5 & 2.6: Background goroutines with shared cancellable context.
+	// Both goroutines are cancelled before the HTTP server shuts down so that
+	// in-flight recovery operations can complete or time out cleanly.
+	// -------------------------------------------------------------------------
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+
+	// Failure Detector — transitions stale nodes ONLINE → OFFLINE
+	failureDetector := coordinator.NewFailureDetector(nodeRepo, logRepo, cfg.Heartbeat)
+	go failureDetector.Run(bgCtx)
+
+	// Self-Healing Engine — re-replicates objects from offline nodes
+	selfHealingEngine := coordinator.NewSelfHealingEngine(
+		db, nodeRepo, replicaRepo, objectRepo, logRepo,
+		placementEngine, cfg.Replication, cfg.Heartbeat,
+	)
+	go selfHealingEngine.Run(bgCtx)
+
 	// Wait for interrupt signal for graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("[SHUTDOWN] Shutting down coordinator service...")
+
+	// Cancel background goroutines before stopping HTTP.
+	bgCancel()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
