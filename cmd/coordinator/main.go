@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"distributed-storage/pkg/auth"
 	"distributed-storage/pkg/config"
 	"distributed-storage/pkg/coordinator"
 	"distributed-storage/pkg/database"
@@ -50,13 +51,17 @@ func main() {
 	}
 
 	// 3. Initialize Repositories
+	userRepo := database.NewUserRepository(db)
 	nodeRepo := database.NewNodeRepository(db)
 	replicaRepo := database.NewReplicaRepository(db)
 	objectRepo := database.NewObjectRepository(db)
 	logRepo := database.NewLogRepository(db)
 
-	// 4. Initialize Placement Engine (used by self-healing)
+	// 4. Initialize Core Services
 	placementEngine := coordinator.NewPlacementEngine(nodeRepo, cfg.Placement)
+	authService := auth.NewAuthService(userRepo, cfg.Auth)
+	authHandler := auth.NewAuthHandler(authService, logRepo)
+	authMiddleware := auth.AuthMiddleware(authService)
 
 	// 5. Initialize HTTP Router
 	router := gin.Default()
@@ -109,6 +114,11 @@ func main() {
 			},
 		})
 	})
+
+	// -------------------------------------------------------------------------
+	// Phase 2.1: Authentication APIs
+	// -------------------------------------------------------------------------
+	authHandler.RegisterRoutes(router, authMiddleware)
 
 	// -------------------------------------------------------------------------
 	// Phase 2.5: Heartbeat receiver endpoint

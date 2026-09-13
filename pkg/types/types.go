@@ -3,6 +3,7 @@ package types
 import (
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -158,3 +159,41 @@ type ReplicaLocation struct {
 	NodeStatus   NodeStatus    `json:"node_status"`
 	InternalURL  string        `json:"internal_url"`
 }
+
+// RegisterRequest represents the payload required to register a new user
+type RegisterRequest struct {
+	Name     string   `json:"name"`
+	Email    string   `json:"email"`
+	Password string   `json:"password"`
+	Role     UserRole `json:"role,omitempty"`
+}
+
+// LoginRequest represents the payload for user authentication
+type LoginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// AuthResponse returns the JWT bearer token and user profile on successful authentication
+type AuthResponse struct {
+	Token string `json:"token"`
+	User  User   `json:"user"`
+}
+
+// JWTClaims holds payload information encoded inside the JWT
+type JWTClaims struct {
+	UserID uuid.UUID `json:"user_id"`
+	Email  string    `json:"email"`
+	Role   UserRole  `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// VerifyResult represents object integrity verification telemetry
+type VerifyResult struct {
+	ObjectID         string `json:"object_id"`
+	Checksum         string `json:"checksum"`
+	FileSize         int64  `json:"file_size"`
+	Valid            bool   `json:"valid"`
+	ExpectedChecksum string `json:"expected_checksum,omitempty"`
+}
+

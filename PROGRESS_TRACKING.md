@@ -85,8 +85,8 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [x] 1.3 Configuration System - Strongly typed environment variables & config loaders
 
 ### Phase 2: Core Services
-- [ ] 2.1 Authentication Service - Register, login, JWT, bcrypt, RBAC middleware
-- [ ] 2.2 Storage Node Service - Go service with internal APIs (store, get, delete, verify), heartbeats
+- [x] 2.1 Authentication Service - Register, login, JWT, bcrypt, RBAC middleware
+- [x] 2.2 Storage Node Service - Go service with internal APIs (store, get, delete, verify), heartbeats
 - [ ] 2.3 Placement Engine - Multi-metric weighted scoring, exclusion thresholds, $N$-node ranking
 - [ ] 2.4 Replication Manager - Adaptive replication, HOT/WARM/COLD classification
 - [x] 2.5 Heartbeat & Failure Detection - Periodic heartbeats, timeout handling, audit logging
@@ -136,12 +136,12 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [ ] Deployment: Docker, Docker Compose
 
 ### Authentication & Security
-- [ ] User registration with bcrypt password hashing
-- [ ] Login with JWT authentication
-- [ ] Protected APIs with JWT validation
-- [ ] Role-based authorization (USER/ADMIN)
-- [ ] Input validation
-- [ ] Ownership validation
+- [x] User registration with bcrypt password hashing
+- [x] Login with JWT authentication
+- [x] Protected APIs with JWT validation
+- [x] Role-based authorization (USER/ADMIN)
+- [x] Input validation
+- [ ] Ownership validation (to be wired into Object APIs)
 
 ### Object Workflow
 - [ ] Upload: authenticate → generate ID → SHA-256 checksum → placement → store on nodes → metadata → success
@@ -345,13 +345,13 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 ## Current Phase: Phase 2: Core Services (Phase 1 Completed)
 
 ### Completed Sub-Phases
+- [x] **2.1** Authentication Service — Register, login, JWT, bcrypt, RBAC middleware, audit logging
+- [x] **2.2** Storage Node Service — store, get, delete, verify (SHA-256 integrity), heartbeats
 - [x] **2.5** Heartbeat & Failure Detection — verified 6/6 tests pass
 - [x] **2.6** Self-Healing System — verified 9/9 tests pass
 
 ### Remaining Sub-Phases
-- [ ] 2.1 Authentication Service
-- [ ] 2.2 Storage Node Service (internal verify endpoint)
-- [ ] 2.3 Placement Engine
+- [ ] 2.3 Placement Engine (Engine complete, waiting for Phase 3 upload integration)
 - [ ] 2.4 Replication Manager (HOT/WARM/COLD adaptive replication)
 
 ---
@@ -385,6 +385,7 @@ All database interaction lives here. Every file follows the same pattern: a `str
 
 | File | What it owns | Key functions |
 | `pkg/database/postgres.go` | DB connection, connection pool config, schema migrations | `Connect()` — opens a Postgres connection pool with retry logic (10 attempts, 2s backoff, for Docker startup race). `RunMigrationsUp()` — applies the full schema (tries the migrations folder first, falls back to an embedded SQL constant). `CheckSchema()` — verifies all 6 required tables exist. Also contains the embedded fallback SQL schema as a Go `const`. |
+| `pkg/database/user_repository.go` | `users` table | `CreateUser()` — stores new user with bcrypt password hash and role. `GetUserByEmail()`, `GetUserByID()`, `EmailExists()`. |
 | `pkg/database/node_repository.go` | `storage_nodes` table | `UpsertNode()` — inserts a new node or refreshes its metrics on heartbeat (keyed by hostname, so a restarted container doesn't create a duplicate). `UpdateHeartbeat()` — updates metrics only, does NOT touch status. `MarkNodeOffline()` — called by the failure detector when a node misses its heartbeat deadline. `GetAllNodes()`, `GetOnlineNodes()`, `GetOfflineNodes()`, `GetNodeByID()`. |
 | `pkg/database/object_repository.go` | `objects` table | `GetObjectByID()` — fetches full object metadata by UUID. This is intentionally minimal right now; upload/delete methods will be added in Phase 3. |
 | `pkg/database/replica_repository.go` | `replicas` table | `GetReplicasByNode()`, `GetReplicasByObject()` — general lookups. `GetHealthyReplicasByObject()` — joins with `storage_nodes` to only return replicas on ONLINE nodes (used by self-healing as copy-source candidates). `InsertReplica()` / `InsertReplicaTx()` — creates a new replica in `RECOVERING` state. `UpdateReplicaStatus()` / `UpdateReplicaStatusTx()` — transitions status. `MarkReplicaLost()` / `MarkReplicaLostTx()` — convenience wrappers. `Tx` variants exist for atomic multi-step operations in self-healing. |
@@ -407,14 +408,25 @@ The core distributed-systems intelligence lives here. These files are used **onl
 
 ---
 
+### `pkg/auth/` — Authentication & Authorization
+
+| File | What it does | Key details |
+|---|---|---|
+| `pkg/auth/service.go` | **User registration, login, and JWT issuance.** Hashes passwords with bcrypt (cost from config), issues signed HMAC-SHA256 JWTs, and verifies incoming tokens. | Cleanses password hashes from user responses. Validates email formats and password lengths. |
+| `pkg/auth/middleware.go` | **Route authentication and RBAC middleware.** Intercepts incoming HTTP requests, verifies `Authorization: Bearer <token>`, injects user identity into Gin context, and enforces role access (`RequireRole(RoleAdmin)`). | Returns standard `AUTH_401` on missing/bad tokens and `AUTH_403` on role mismatches. |
+| `pkg/auth/handler.go` | **REST handlers for auth endpoints.** `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/validate`. | Writes audit records to `system_logs`. |
+| `pkg/auth/service_test.go` | Unit tests for auth, token generation, and middleware. | Full unit coverage with mock/fake in-memory user repository. |
+
+---
+
 ### `pkg/node/` — Storage Node Business Logic
 
 Logic that runs **only** on the storage node binary.
 
 | File | What it does | Key details |
 |---|---|---|
-| `pkg/node/storage_handler.go` | **Internal HTTP handlers for raw object data.** Implements `POST /internal/storage/store` (write file to disk), `GET /internal/storage/:id` (stream file to caller), and `DELETE /internal/storage/:id` (remove file). UUIDs are validated on every route to prevent path-traversal attacks. Files are stored flat in the configured `storagePath` directory, named by their object UUID. | Only the coordinator should call these routes. They are internal APIs, not exposed to end users. |
-| `pkg/node/storage_handler_test.go` | Unit tests for the storage handler. | Tests cover: store + retrieve round-trip, delete, missing object 404, invalid UUID rejection. |
+| `pkg/node/storage_handler.go` | **Internal HTTP handlers for raw object data.** Implements `POST /internal/storage/store` (write file to disk), `GET /internal/storage/:id` (stream file to caller), `GET /internal/storage/:id/verify` (calculate SHA-256 and test integrity), and `DELETE /internal/storage/:id` (remove file). UUIDs are validated on every route to prevent path-traversal attacks. Files are stored flat in the configured `storagePath` directory, named by their object UUID. | Only the coordinator should call these routes. They are internal APIs, not exposed to end users. |
+| `pkg/node/storage_handler_test.go` | Unit tests for the storage handler. | Tests cover: store + retrieve round-trip, delete, missing object 404, invalid UUID rejection, SHA-256 checksum calculation, and integrity mismatch detection. |
 | `pkg/node/heartbeat_sender.go` | **Periodic telemetry reporter.** Runs as a background goroutine on each storage node. Every configurable interval, it collects real system metrics (disk usage, CPU, memory, latency) and POSTs a `HeartbeatPayload` JSON to the coordinator's heartbeat endpoint. | This is what keeps a node "alive" in the coordinator's view. If this stops sending, the failure detector will eventually mark the node OFFLINE. |
 
 ---
