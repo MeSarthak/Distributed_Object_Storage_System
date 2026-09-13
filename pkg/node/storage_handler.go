@@ -1,11 +1,14 @@
 package node
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"distributed-storage/pkg/types"
 
@@ -14,14 +17,15 @@ import (
 )
 
 // StorageHandler provides the internal HTTP handlers that the coordinator
-// (and specifically the self-healing engine) uses to store, retrieve, and
-// delete object data on this node.
+// (and specifically the self-healing engine) uses to store, retrieve,
+// verify, and delete object data on this node.
 //
 // Routes registered:
 //
-//	POST   /internal/storage/store   — receive and write object data
-//	GET    /internal/storage/:id     — stream object data to caller
-//	DELETE /internal/storage/:id     — delete object data from local disk
+//	POST   /internal/storage/store       — receive and write object data
+//	GET    /internal/storage/:id         — stream object data to caller
+//	GET    /internal/storage/:id/verify  — verify object integrity and compute SHA-256
+//	DELETE /internal/storage/:id         — delete object data from local disk
 type StorageHandler struct {
 	storagePath string
 }
@@ -31,12 +35,14 @@ func NewStorageHandler(storagePath string) *StorageHandler {
 	return &StorageHandler{storagePath: storagePath}
 }
 
-// RegisterRoutes attaches the three internal storage routes to the given Gin engine.
+// RegisterRoutes attaches the internal storage routes to the given Gin engine.
 func (sh *StorageHandler) RegisterRoutes(router *gin.Engine) {
 	internal := router.Group("/internal/storage")
 	{
 		internal.POST("/store", sh.Store)
 		internal.GET("/:id", sh.Get)
+		internal.GET("/:id/verify", sh.Verify)
+		internal.GET("/verify/:id", sh.Verify)
 		internal.DELETE("/:id", sh.Delete)
 	}
 }
@@ -239,3 +245,92 @@ func (sh *StorageHandler) Delete(c *gin.Context) {
 		Data:    gin.H{"object_id": objectID},
 	})
 }
+
+// Verify handles GET /internal/storage/:id/verify and GET /internal/storage/verify/:id.
+// Calculates the SHA-256 checksum and size of the object stored on disk.
+// If expected checksum is supplied via query param (checksum or expected_checksum) or
+// If-Match header, it performs an integrity match check.
+func (sh *StorageHandler) Verify(c *gin.Context) {
+	objectID := c.Param("id")
+	if objectID == "" {
+		c.JSON(http.StatusBadRequest, types.StandardResponse{
+			Success:   false,
+			Message:   "object id is required",
+			ErrorCode: types.ErrCodeValidationFailed,
+		})
+		return
+	}
+	// Validate UUID to prevent path traversal via crafted :id parameters.
+	if _, err := uuid.Parse(objectID); err != nil {
+		c.JSON(http.StatusBadRequest, types.StandardResponse{
+			Success:   false,
+			Message:   "object id must be a valid UUID",
+			ErrorCode: types.ErrCodeValidationFailed,
+		})
+		return
+	}
+
+	filePath := filepath.Join(sh.storagePath, objectID)
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			c.JSON(http.StatusNotFound, types.StandardResponse{
+				Success:   false,
+				Message:   "object not found on this node",
+				ErrorCode: types.ErrCodeObjectNotFound,
+			})
+			return
+		}
+		log.Printf("[STORAGE] ERROR opening file %s for verify: %v", filePath, err)
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "failed to open object file",
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+	defer f.Close()
+
+	hasher := sha256.New()
+	size, err := io.Copy(hasher, f)
+	if err != nil {
+		log.Printf("[STORAGE] ERROR calculating checksum for %s: %v", filePath, err)
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "failed to read object for checksum calculation",
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+
+	computedChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+	// Check optional expected checksum from query parameter or If-Match header
+	expectedChecksum := c.Query("checksum")
+	if expectedChecksum == "" {
+		expectedChecksum = c.Query("expected_checksum")
+	}
+	if expectedChecksum == "" {
+		expectedChecksum = c.GetHeader("If-Match")
+	}
+
+	isValid := true
+	if expectedChecksum != "" {
+		isValid = strings.EqualFold(strings.TrimSpace(expectedChecksum), computedChecksum)
+	}
+
+	log.Printf("[STORAGE] Verified object %s (sha256=%s, valid=%t)", objectID, computedChecksum, isValid)
+	c.JSON(http.StatusOK, types.StandardResponse{
+		Success: true,
+		Message: "Object integrity verification completed",
+		Data: types.VerifyResult{
+			ObjectID:         objectID,
+			Checksum:         computedChecksum,
+			FileSize:         size,
+			Valid:            isValid,
+			ExpectedChecksum: expectedChecksum,
+		},
+	})
+}
+
