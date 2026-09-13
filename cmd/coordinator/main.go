@@ -17,6 +17,7 @@ import (
 	"distributed-storage/pkg/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -172,9 +173,104 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
+	// Phase 2.3: Placement Inspection API (used by Admin Dashboard formula inspector)
+	// -------------------------------------------------------------------------
+	router.GET("/api/cluster/placement/evaluate", func(c *gin.Context) {
+		nodes, err := nodeRepo.GetAllNodes()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, types.StandardResponse{
+				Success:   false,
+				Message:   "Failed to fetch nodes: " + err.Error(),
+				ErrorCode: types.ErrCodeMetadataFailure,
+			})
+			return
+		}
+
+		evaluations := placementEngine.EvaluateNodes(nodes, 0, nil)
+		c.JSON(http.StatusOK, types.StandardResponse{
+			Success: true,
+			Message: "Placement formula evaluation computed",
+			Data: gin.H{
+				"evaluations": evaluations,
+				"weights": gin.H{
+					"storage": cfg.Placement.WeightStorage,
+					"cpu":     cfg.Placement.WeightCPU,
+					"ram":     cfg.Placement.WeightRAM,
+					"latency": cfg.Placement.WeightLatency,
+					"health":  cfg.Placement.WeightHealth,
+				},
+				"thresholds": gin.H{
+					"max_cpu":               cfg.Placement.MaxCPUThreshold,
+					"max_ram":               cfg.Placement.MaxRAMThreshold,
+					"min_free_storage_bytes": cfg.Placement.MinFreeStorageBytes,
+				},
+			},
+		})
+	})
+
+	// -------------------------------------------------------------------------
+	// Phase 2.4: Adaptive Replication APIs
+	// -------------------------------------------------------------------------
+	replicationManager := coordinator.NewReplicationManager(
+		db, objectRepo, replicaRepo, nodeRepo, logRepo,
+		placementEngine, cfg.Replication, 30*time.Second,
+	)
+
+	router.POST("/api/cluster/rebalance", func(c *gin.Context) {
+		results, err := replicationManager.RebalanceAll(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, types.StandardResponse{
+				Success:   false,
+				Message:   "Rebalance failed: " + err.Error(),
+				ErrorCode: types.ErrCodeReplicaFailure,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, types.StandardResponse{
+			Success: true,
+			Message: "Adaptive replication rebalance completed",
+			Data:    results,
+		})
+	})
+
+	router.GET("/api/objects/:id/tier", func(c *gin.Context) {
+		objectIDStr := c.Param("id")
+		objID, err := uuid.Parse(objectIDStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, types.StandardResponse{
+				Success:   false,
+				Message:   "invalid object id: " + err.Error(),
+				ErrorCode: types.ErrCodeValidationFailed,
+			})
+			return
+		}
+
+		tier, count, targetFactor, currFactor, err := replicationManager.GetObjectClassification(objID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, types.StandardResponse{
+				Success:   false,
+				Message:   "object not found: " + err.Error(),
+				ErrorCode: types.ErrCodeObjectNotFound,
+			})
+			return
+		}
+
+		c.JSON(http.StatusOK, types.StandardResponse{
+			Success: true,
+			Message: "Object tier retrieved",
+			Data: gin.H{
+				"object_id":                objID,
+				"tier":                     tier,
+				"access_count_24h":         count,
+				"target_replication_factor": targetFactor,
+				"current_replication_factor": currFactor,
+			},
+		})
+	})
+
+	// -------------------------------------------------------------------------
 	// Phase 2.5 & 2.6: Background goroutines with shared cancellable context.
-	// Both goroutines are cancelled before the HTTP server shuts down so that
-	// in-flight recovery operations can complete or time out cleanly.
+	// All background goroutines are cancelled before the HTTP server shuts down.
 	// -------------------------------------------------------------------------
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 
@@ -188,6 +284,9 @@ func main() {
 		placementEngine, cfg.Replication, cfg.Heartbeat,
 	)
 	go selfHealingEngine.Run(bgCtx)
+
+	// Adaptive Replication Manager — dynamic scale up/down loop
+	go replicationManager.Run(bgCtx)
 
 	// Wait for interrupt signal for graceful shutdown
 	quit := make(chan os.Signal, 1)

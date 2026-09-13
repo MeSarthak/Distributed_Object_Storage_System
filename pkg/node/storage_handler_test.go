@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
+	"fmt"
 	"distributed-storage/pkg/types"
 
 	"github.com/gin-gonic/gin"

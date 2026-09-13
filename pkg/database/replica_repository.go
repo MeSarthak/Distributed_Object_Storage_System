@@ -161,6 +161,34 @@ func (r *ReplicaRepository) MarkReplicaLostTx(tx *sql.Tx, replicaID uuid.UUID) e
 	return r.UpdateReplicaStatusTx(tx, replicaID, types.ReplicaStatusLost)
 }
 
+// DeleteReplica removes a replica record by its ID.
+func (r *ReplicaRepository) DeleteReplica(replicaID uuid.UUID) error {
+	query := `DELETE FROM replicas WHERE replica_id = $1`
+	res, err := r.db.Exec(query, replicaID)
+	if err != nil {
+		return fmt.Errorf("delete replica %s: %w", replicaID, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("replica %s not found for deletion", replicaID)
+	}
+	return nil
+}
+
+// DeleteReplicaTx removes a replica record inside an existing transaction.
+func (r *ReplicaRepository) DeleteReplicaTx(tx *sql.Tx, replicaID uuid.UUID) error {
+	query := `DELETE FROM replicas WHERE replica_id = $1`
+	res, err := tx.Exec(query, replicaID)
+	if err != nil {
+		return fmt.Errorf("tx delete replica %s: %w", replicaID, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("replica %s not found in tx deletion", replicaID)
+	}
+	return nil
+}
+
 // --- internal scan helpers ---------------------------------------------------
 
 func scanReplicas(rows *sql.Rows) ([]types.Replica, error) {

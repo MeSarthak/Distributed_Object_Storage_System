@@ -35,26 +35,44 @@ type candidateNode struct {
 	score float64
 }
 
+// PlacementStrategy represents selectable placement algorithms.
+type PlacementStrategy string
+
+const (
+	StrategyWeightedScore PlacementStrategy = "WEIGHTED_SCORE"
+	StrategyLeastLoaded   PlacementStrategy = "LEAST_LOADED"
+	StrategyRoundRobin    PlacementStrategy = "ROUND_ROBIN"
+)
+
+// NodeEvaluation holds a granular score and eligibility breakdown for a node.
+type NodeEvaluation struct {
+	Node             types.StorageNode `json:"node"`
+	StorageFreeScore float64           `json:"storage_free_score"`
+	CPUScore         float64           `json:"cpu_score"`
+	RAMScore         float64           `json:"ram_score"`
+	LatencyScore     float64           `json:"latency_score"`
+	HealthScore      float64           `json:"health_score"`
+	TotalScore       float64           `json:"total_score"`
+	Eligible         bool              `json:"eligible"`
+	ExclusionReason  string            `json:"exclusion_reason,omitempty"`
+}
+
 // SelectNodes returns up to `count` ONLINE storage nodes that are eligible for
-// replica placement.  Nodes whose IDs appear in `excludeNodeIDs` are skipped
-// (the failed node and any nodes already holding a replica of the object).
-//
-// The scoring formula for each eligible node is:
-//
-//	score = W_storage  * storageFreeScore
-//	      + W_cpu      * (1 - cpuUsage/100)
-//	      + W_ram      * (1 - memoryUsage/100)
-//	      + W_latency  * latencyScore
-//	      + W_health   * 1.0          (node is ONLINE by this point)
-//
-// Where:
-//   - storageFreeScore = freeBytes / totalBytes   (clamped [0,1])
-//   - latencyScore     = 1 / (1 + latency_ms/100) (approaches 0 for high latency)
-//
-// Returns an error if fewer than `count` eligible nodes exist.
+// replica placement using the default file size 0.
 func (pe *PlacementEngine) SelectNodes(
 	ctx context.Context,
 	count int,
+	excludeNodeIDs []uuid.UUID,
+) ([]types.StorageNode, error) {
+	return pe.SelectNodesWithFileSize(ctx, count, 0, excludeNodeIDs)
+}
+
+// SelectNodesWithFileSize selects up to `count` eligible ONLINE storage nodes,
+// taking into account the incoming object's fileSize to ensure sufficient capacity.
+func (pe *PlacementEngine) SelectNodesWithFileSize(
+	ctx context.Context,
+	count int,
+	fileSize int64,
 	excludeNodeIDs []uuid.UUID,
 ) ([]types.StorageNode, error) {
 	onlineNodes, err := pe.nodeRepo.GetOnlineNodes()
@@ -62,87 +80,121 @@ func (pe *PlacementEngine) SelectNodes(
 		return nil, fmt.Errorf("placement: fetch online nodes: %w", err)
 	}
 
-	// Build exclusion set for O(1) lookup.
+	evaluations := pe.EvaluateNodes(onlineNodes, fileSize, excludeNodeIDs)
+
+	var eligibleCandidates []NodeEvaluation
+	for _, eval := range evaluations {
+		if eval.Eligible {
+			eligibleCandidates = append(eligibleCandidates, eval)
+		}
+	}
+
+	if len(eligibleCandidates) < count {
+		return nil, fmt.Errorf(
+			"placement: need %d nodes but only %d eligible (online=%d, excluded=%d)",
+			count, len(eligibleCandidates), len(onlineNodes), len(excludeNodeIDs),
+		)
+	}
+
+	// Sort descending by score so the best nodes come first.
+	sort.Slice(eligibleCandidates, func(i, j int) bool {
+		return eligibleCandidates[i].TotalScore > eligibleCandidates[j].TotalScore
+	})
+
+	selected := make([]types.StorageNode, count)
+	for i := 0; i < count; i++ {
+		selected[i] = eligibleCandidates[i].Node
+	}
+	return selected, nil
+}
+
+// EvaluateNodes evaluates all given nodes and returns detailed scores and eligibility reasons.
+func (pe *PlacementEngine) EvaluateNodes(
+	nodes []types.StorageNode,
+	fileSize int64,
+	excludeNodeIDs []uuid.UUID,
+) []NodeEvaluation {
 	excluded := make(map[uuid.UUID]struct{}, len(excludeNodeIDs))
 	for _, id := range excludeNodeIDs {
 		excluded[id] = struct{}{}
 	}
 
-	var candidates []candidateNode
-	for _, node := range onlineNodes {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+	evaluations := make([]NodeEvaluation, 0, len(nodes))
+	for _, node := range nodes {
+		eval := pe.evaluateSingleNode(node)
+
+		if node.Status != types.NodeStatusOnline {
+			eval.Eligible = false
+			eval.ExclusionReason = fmt.Sprintf("node status is %s", node.Status)
+		} else if _, skip := excluded[node.NodeID]; skip {
+			eval.Eligible = false
+			eval.ExclusionReason = "explicitly excluded (already holds replica or failed)"
+		} else if node.CPUUsage > pe.cfg.MaxCPUThreshold {
+			eval.Eligible = false
+			eval.ExclusionReason = fmt.Sprintf("CPU usage (%.1f%%) exceeds threshold (%.1f%%)", node.CPUUsage, pe.cfg.MaxCPUThreshold)
+		} else if node.MemoryUsage > pe.cfg.MaxRAMThreshold {
+			eval.Eligible = false
+			eval.ExclusionReason = fmt.Sprintf("RAM usage (%.1f%%) exceeds threshold (%.1f%%)", node.MemoryUsage, pe.cfg.MaxRAMThreshold)
+		} else {
+			freeBytes := node.TotalStorage - node.UsedStorage
+			requiredBytes := pe.cfg.MinFreeStorageBytes
+			if fileSize > 0 {
+				requiredBytes += fileSize
+			}
+			if freeBytes < requiredBytes {
+				eval.Eligible = false
+				eval.ExclusionReason = fmt.Sprintf("free storage (%d bytes) is less than required (%d bytes)", freeBytes, requiredBytes)
+			} else {
+				eval.Eligible = true
+			}
 		}
 
-		// Honour explicit exclusions.
-		if _, skip := excluded[node.NodeID]; skip {
-			continue
-		}
-
-		// Honour hard exclusion thresholds.
-		if node.CPUUsage > pe.cfg.MaxCPUThreshold {
-			continue
-		}
-		if node.MemoryUsage > pe.cfg.MaxRAMThreshold {
-			continue
-		}
-		freeBytes := node.TotalStorage - node.UsedStorage
-		if freeBytes < pe.cfg.MinFreeStorageBytes {
-			continue
-		}
-
-		score := pe.scoreNode(node)
-		candidates = append(candidates, candidateNode{node: node, score: score})
+		evaluations = append(evaluations, eval)
 	}
 
-	if len(candidates) < count {
-		return nil, fmt.Errorf(
-			"placement: need %d nodes but only %d eligible (online=%d, excluded=%d)",
-			count, len(candidates), len(onlineNodes), len(excludeNodeIDs),
-		)
-	}
-
-	// Sort descending by score so the best nodes come first.
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
-	})
-
-	selected := make([]types.StorageNode, count)
-	for i := 0; i < count; i++ {
-		selected[i] = candidates[i].node
-	}
-	return selected, nil
+	return evaluations
 }
 
-// scoreNode computes the weighted placement score for a single node.
-// All component scores are normalised to [0, 1] so that the weights
-// (which must sum to 1.0 by config validation) produce a total in [0, 1].
+// ScoreNode computes the weighted placement score for a single node.
+func (pe *PlacementEngine) ScoreNode(node types.StorageNode) float64 {
+	return pe.scoreNode(node)
+}
+
+// scoreNode computes the weighted placement score for a single node (unexported alias for internal callers).
 func (pe *PlacementEngine) scoreNode(node types.StorageNode) float64 {
-	// Storage score: fraction of total capacity that is free.
+	eval := pe.evaluateSingleNode(node)
+	return eval.TotalScore
+}
+
+func (pe *PlacementEngine) evaluateSingleNode(node types.StorageNode) NodeEvaluation {
 	var storageFreeScore float64
 	if node.TotalStorage > 0 {
 		free := float64(node.TotalStorage - node.UsedStorage)
 		storageFreeScore = math.Max(0, math.Min(1, free/float64(node.TotalStorage)))
 	}
 
-	// CPU score: inverse of utilisation.
 	cpuScore := 1.0 - math.Min(1.0, node.CPUUsage/100.0)
-
-	// RAM score: inverse of utilisation.
 	ramScore := 1.0 - math.Min(1.0, node.MemoryUsage/100.0)
-
-	// Latency score: sigmoid-like decay; 0 ms → 1.0, very high ms → ~0.
-	// Formula: 1 / (1 + latency_ms/100)
 	latencyScore := 1.0 / (1.0 + node.Latency/100.0)
+	healthScore := 0.0
+	if node.Status == types.NodeStatusOnline {
+		healthScore = 1.0
+	}
 
-	// Health score: always 1.0 for ONLINE nodes (already filtered).
-	healthScore := 1.0
-
-	return pe.cfg.WeightStorage*storageFreeScore +
+	totalScore := pe.cfg.WeightStorage*storageFreeScore +
 		pe.cfg.WeightCPU*cpuScore +
 		pe.cfg.WeightRAM*ramScore +
 		pe.cfg.WeightLatency*latencyScore +
 		pe.cfg.WeightHealth*healthScore
+
+	return NodeEvaluation{
+		Node:             node,
+		StorageFreeScore: storageFreeScore,
+		CPUScore:         cpuScore,
+		RAMScore:         ramScore,
+		LatencyScore:     latencyScore,
+		HealthScore:      healthScore,
+		TotalScore:       totalScore,
+	}
 }
+

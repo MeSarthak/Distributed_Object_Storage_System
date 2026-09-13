@@ -87,8 +87,8 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 ### Phase 2: Core Services
 - [x] 2.1 Authentication Service - Register, login, JWT, bcrypt, RBAC middleware
 - [x] 2.2 Storage Node Service - Go service with internal APIs (store, get, delete, verify), heartbeats
-- [ ] 2.3 Placement Engine - Multi-metric weighted scoring, exclusion thresholds, $N$-node ranking
-- [ ] 2.4 Replication Manager - Adaptive replication, HOT/WARM/COLD classification
+- [x] 2.3 Placement Engine - Multi-metric weighted scoring, exclusion thresholds, $N$-node ranking
+- [x] 2.4 Replication Manager - Adaptive replication, HOT/WARM/COLD classification
 - [x] 2.5 Heartbeat & Failure Detection - Periodic heartbeats, timeout handling, audit logging
 - [x] 2.6 Self-Healing System - Automatic replica recovery on node failure with atomic updates
 
@@ -342,17 +342,15 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 
 ---
 
-## Current Phase: Phase 2: Core Services (Phase 1 Completed)
+## Current Phase: Phase 3: API Endpoints (Phase 1 & 2 Completed)
 
-### Completed Sub-Phases
+### Completed Sub-Phases (Phase 2: Core Services)
 - [x] **2.1** Authentication Service — Register, login, JWT, bcrypt, RBAC middleware, audit logging
 - [x] **2.2** Storage Node Service — store, get, delete, verify (SHA-256 integrity), heartbeats
+- [x] **2.3** Placement Engine — Multi-metric weighted scoring, exclusion thresholds, $N$-node ranking, formula inspector
+- [x] **2.4** Replication Manager — Adaptive replication, HOT/WARM/COLD classification, scale-up/scale-down with minimum floor guarantee
 - [x] **2.5** Heartbeat & Failure Detection — verified 6/6 tests pass
 - [x] **2.6** Self-Healing System — verified 9/9 tests pass
-
-### Remaining Sub-Phases
-- [ ] 2.3 Placement Engine (Engine complete, waiting for Phase 3 upload integration)
-- [ ] 2.4 Replication Manager (HOT/WARM/COLD adaptive replication)
 
 ---
 
