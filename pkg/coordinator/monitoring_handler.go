@@ -1,0 +1,245 @@
+package coordinator
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"time"
+
+	"distributed-storage/pkg/database"
+	"distributed-storage/pkg/types"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+// MonitoringHandler provides cluster telemetry, node metrics, audit logs,
+// and deep object metadata inspection endpoints.
+// Assigned to: Developer 3
+type MonitoringHandler struct {
+	db            *database.DB
+	nodeRepo      *database.NodeRepository
+	objectRepo    *database.ObjectRepository
+	replicaRepo   *database.ReplicaRepository
+	logRepo       *database.LogRepository
+	accessLogRepo *database.AccessLogRepository
+}
+
+// NewMonitoringHandler constructs a MonitoringHandler.
+func NewMonitoringHandler(
+	db *database.DB,
+	nodeRepo *database.NodeRepository,
+	objectRepo *database.ObjectRepository,
+	replicaRepo *database.ReplicaRepository,
+	logRepo *database.LogRepository,
+	accessLogRepo *database.AccessLogRepository,
+) *MonitoringHandler {
+	return &MonitoringHandler{
+		db:            db,
+		nodeRepo:      nodeRepo,
+		objectRepo:    objectRepo,
+		replicaRepo:   replicaRepo,
+		logRepo:       logRepo,
+		accessLogRepo: accessLogRepo,
+	}
+}
+
+// ClusterStatus handles GET /api/cluster/status.
+// Returns aggregate cluster capacity, node counts, and overall health status.
+func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
+	nodes, err := h.nodeRepo.GetAllNodes()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "Failed to fetch nodes for cluster status: " + err.Error(),
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+
+	var totalStorage, usedStorage int64
+	var onlineNodes, offlineNodes int
+
+	for _, node := range nodes {
+		totalStorage += node.TotalStorage
+		usedStorage += node.UsedStorage
+		if node.Status == types.NodeStatusOnline {
+			onlineNodes++
+		} else {
+			offlineNodes++
+		}
+	}
+
+	var totalObjects int64
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects").Scan(&totalObjects)
+
+	clusterHealth := "HEALTHY"
+	if offlineNodes > 0 {
+		clusterHealth = "DEGRADED"
+	}
+	if onlineNodes == 0 && len(nodes) > 0 {
+		clusterHealth = "CRITICAL"
+	}
+
+	c.JSON(http.StatusOK, types.StandardResponse{
+		Success: true,
+		Message: "Cluster status retrieved successfully",
+		Data: gin.H{
+			"status":         clusterHealth,
+			"total_nodes":    len(nodes),
+			"online_nodes":   onlineNodes,
+			"offline_nodes":  offlineNodes,
+			"total_storage":  totalStorage,
+			"used_storage":   usedStorage,
+			"total_objects":  totalObjects,
+			"timestamp":      time.Now().UTC(),
+		},
+	})
+}
+
+// ClusterNodes handles GET /api/cluster/nodes.
+// Returns detailed node metrics for every registered storage node.
+func (h *MonitoringHandler) ClusterNodes(c *gin.Context) {
+	nodes, err := h.nodeRepo.GetAllNodes()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "Failed to retrieve node list: " + err.Error(),
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, types.StandardResponse{
+		Success: true,
+		Message: "Storage nodes retrieved successfully",
+		Data: gin.H{
+			"nodes": nodes,
+			"count": len(nodes),
+		},
+	})
+}
+
+// SystemLogs handles GET /api/logs.
+// Returns paginated audit logs filtered by severity and event_type.
+func (h *MonitoringHandler) SystemLogs(c *gin.Context) {
+	severity := types.LogSeverity(c.Query("severity"))
+	eventType := c.Query("event_type")
+
+	limit := 50
+	offset := 0
+	if l := c.Query("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			limit = val
+		}
+	}
+	if o := c.Query("offset"); o != "" {
+		if val, err := strconv.Atoi(o); err == nil && val >= 0 {
+			offset = val
+		}
+	}
+
+	logs, err := h.logRepo.GetSystemLogs(severity, eventType, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "Failed to fetch system logs: " + err.Error(),
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+
+	if logs == nil {
+		logs = []types.SystemLog{}
+	}
+
+	c.JSON(http.StatusOK, types.StandardResponse{
+		Success: true,
+		Message: "System audit logs retrieved successfully",
+		Data: gin.H{
+			"logs":   logs,
+			"count":  len(logs),
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+// Metadata handles GET /api/metadata/:id.
+// Returns deep object metadata including physical replica locations and current access tier.
+func (h *MonitoringHandler) Metadata(c *gin.Context) {
+	idStr := c.Param("id")
+	objectID, err := uuid.Parse(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, types.StandardResponse{
+			Success:   false,
+			Message:   "Invalid object UUID format",
+			ErrorCode: types.ErrCodeValidationFailed,
+		})
+		return
+	}
+
+	obj, err := h.objectRepo.GetObjectByID(objectID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, types.StandardResponse{
+			Success:   false,
+			Message:   "Object not found",
+			ErrorCode: types.ErrCodeObjectNotFound,
+		})
+		return
+	}
+
+	// Fetch replicas
+	replicas, err := h.replicaRepo.GetReplicasByObject(objectID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, types.StandardResponse{
+			Success:   false,
+			Message:   "Failed to fetch replicas: " + err.Error(),
+			ErrorCode: types.ErrCodeMetadataFailure,
+		})
+		return
+	}
+
+	locations := make([]types.ReplicaLocation, 0, len(replicas))
+	for _, rep := range replicas {
+		loc := types.ReplicaLocation{
+			ReplicaID: rep.ReplicaID,
+			NodeID:    rep.NodeID,
+			Status:    rep.Status,
+		}
+
+		if node, err := h.nodeRepo.GetNodeByID(rep.NodeID); err == nil {
+			loc.Hostname = node.Hostname
+			loc.IPAddress = node.IPAddress
+			loc.NodeStatus = node.Status
+			loc.InternalURL = fmt.Sprintf("%s/internal/storage/%s", BuildNodeURL(*node), objectID)
+		}
+		locations = append(locations, loc)
+	}
+
+	// Calculate recent access frequency (last 24 hours) for tier classification
+	tier := string(types.TierWarm)
+	if h.accessLogRepo != nil {
+		since := time.Now().Add(-24 * time.Hour)
+		count, err := h.accessLogRepo.GetAccessCountSince(objectID, since)
+		if err == nil {
+			if count >= 10 {
+				tier = string(types.TierHot)
+			} else if count == 0 && time.Since(obj.LastAccessed) > 7*24*time.Hour {
+				tier = string(types.TierCold)
+			}
+		}
+	}
+
+	meta := types.ObjectMetadataWithReplicas{
+		Object:   *obj,
+		Replicas: locations,
+		Tier:     tier,
+	}
+
+	c.JSON(http.StatusOK, types.StandardResponse{
+		Success: true,
+		Message: "Object metadata retrieved successfully",
+		Data:    meta,
+	})
+}

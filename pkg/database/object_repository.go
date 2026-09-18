@@ -226,3 +226,98 @@ func scanObject(row *sql.Row) (*types.Object, error) {
 	obj.LastAccessed = lastAccessed
 	return &obj, nil
 }
+
+// GetObjectsByOwner returns paginated objects belonging to a specific user.
+func (r *ObjectRepository) GetObjectsByOwner(ownerID uuid.UUID, limit, offset int) ([]types.Object, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := `
+		SELECT object_id, owner_id, object_name, file_size, mime_type,
+		       checksum, upload_time, last_accessed, replication_factor
+		FROM objects
+		WHERE owner_id = $1
+		ORDER BY upload_time DESC
+		LIMIT $2 OFFSET $3
+	`
+	rows, err := r.db.Query(query, ownerID, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get objects by owner %s: %w", ownerID, err)
+	}
+	defer rows.Close()
+
+	var objects []types.Object
+	for rows.Next() {
+		var obj types.Object
+		var uploadTime, lastAccessed time.Time
+		err := rows.Scan(
+			&obj.ObjectID,
+			&obj.OwnerID,
+			&obj.ObjectName,
+			&obj.FileSize,
+			&obj.MimeType,
+			&obj.Checksum,
+			&uploadTime,
+			&lastAccessed,
+			&obj.ReplicationFactor,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan object row: %w", err)
+		}
+		obj.UploadTime = uploadTime
+		obj.LastAccessed = lastAccessed
+		objects = append(objects, obj)
+	}
+	return objects, rows.Err()
+}
+
+// SearchObjects searches objects belonging to a specific user matching a name query.
+func (r *ObjectRepository) SearchObjects(ownerID uuid.UUID, queryStr string, limit, offset int) ([]types.Object, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	query := `
+		SELECT object_id, owner_id, object_name, file_size, mime_type,
+		       checksum, upload_time, last_accessed, replication_factor
+		FROM objects
+		WHERE owner_id = $1 AND object_name ILIKE $2
+		ORDER BY upload_time DESC
+		LIMIT $3 OFFSET $4
+	`
+	rows, err := r.db.Query(query, ownerID, "%"+queryStr+"%", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("search objects for owner %s query %s: %w", ownerID, queryStr, err)
+	}
+	defer rows.Close()
+
+	var objects []types.Object
+	for rows.Next() {
+		var obj types.Object
+		var uploadTime, lastAccessed time.Time
+		err := rows.Scan(
+			&obj.ObjectID,
+			&obj.OwnerID,
+			&obj.ObjectName,
+			&obj.FileSize,
+			&obj.MimeType,
+			&obj.Checksum,
+			&uploadTime,
+			&lastAccessed,
+			&obj.ReplicationFactor,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan object row: %w", err)
+		}
+		obj.UploadTime = uploadTime
+		obj.LastAccessed = lastAccessed
+		objects = append(objects, obj)
+	}
+	return objects, rows.Err()
+}
+
