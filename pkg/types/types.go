@@ -44,6 +44,38 @@ const (
 	SeverityCritical LogSeverity = "CRITICAL"
 )
 
+// Access Tiers for Adaptive Replication
+type AccessTier string
+
+const (
+	TierHot  AccessTier = "HOT"
+	TierWarm AccessTier = "WARM"
+	TierCold AccessTier = "COLD"
+)
+
+// Placement Strategies
+type PlacementStrategy string
+
+const (
+	PlacementStrategyWeighted    PlacementStrategy = "weighted"
+	PlacementStrategyLeastLoaded PlacementStrategy = "least_loaded"
+	PlacementStrategyRoundRobin  PlacementStrategy = "round_robin"
+)
+
+// System Log Event Types
+const (
+	EventNodeFailure           = "NODE_FAILURE"
+	EventRecoveryStart         = "RECOVERY_START"
+	EventRecoverySuccess       = "RECOVERY_SUCCESS"
+	EventRecoveryFailed        = "RECOVERY_FAILED"
+	EventChecksumMismatch      = "CHECKSUM_MISMATCH"
+	EventReplicationScaleUp    = "REPLICATION_SCALE_UP"
+	EventReplicationScaleDown  = "REPLICATION_SCALE_DOWN"
+	EventReplicationTierChange = "REPLICATION_TIER_CHANGE"
+	EventUserRegister          = "USER_REGISTER"
+	EventUserLogin             = "USER_LOGIN"
+)
+
 // Standard Error Codes
 const (
 	ErrCodeAuthUnauthorized = "AUTH_401"

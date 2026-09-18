@@ -7,11 +7,21 @@ import (
 	"time"
 
 	"distributed-storage/pkg/config"
-	"distributed-storage/pkg/database"
 	"distributed-storage/pkg/types"
 
 	"github.com/google/uuid"
 )
+
+// FailureDetectorNodeRepo abstracts storage_nodes querying and status updating.
+type FailureDetectorNodeRepo interface {
+	GetAllNodes() ([]types.StorageNode, error)
+	MarkNodeOffline(nodeID uuid.UUID) error
+}
+
+// FailureDetectorLogRepo abstracts system logging for failure detection.
+type FailureDetectorLogRepo interface {
+	InsertSystemLog(eventType string, description string, severity types.LogSeverity, metadata map[string]string) error
+}
 
 // FailureDetector runs a background goroutine that periodically checks all
 // storage nodes and transitions any node whose last_heartbeat has exceeded the
@@ -25,8 +35,8 @@ import (
 //     that a subsequent failure will be logged again.
 //   - Failures in the detection loop are logged but never crash the goroutine.
 type FailureDetector struct {
-	nodeRepo *database.NodeRepository
-	logRepo  *database.LogRepository
+	nodeRepo FailureDetectorNodeRepo
+	logRepo  FailureDetectorLogRepo
 	cfg      config.HeartbeatConfig
 
 	// alreadyOffline tracks node IDs that we have already emitted a
@@ -38,8 +48,8 @@ type FailureDetector struct {
 
 // NewFailureDetector constructs a FailureDetector.
 func NewFailureDetector(
-	nodeRepo *database.NodeRepository,
-	logRepo *database.LogRepository,
+	nodeRepo FailureDetectorNodeRepo,
+	logRepo FailureDetectorLogRepo,
 	cfg config.HeartbeatConfig,
 ) *FailureDetector {
 	return &FailureDetector{
@@ -65,13 +75,13 @@ func (fd *FailureDetector) Run(ctx context.Context) {
 			log.Println("[FAILURE_DETECTOR] Shutting down.")
 			return
 		case <-ticker.C:
-			fd.detect(ctx)
+			fd.Detect(ctx)
 		}
 	}
 }
 
-// detect performs one detection sweep.
-func (fd *FailureDetector) detect(ctx context.Context) {
+// Detect performs one detection sweep.
+func (fd *FailureDetector) Detect(ctx context.Context) {
 	nodes, err := fd.nodeRepo.GetAllNodes()
 	if err != nil {
 		log.Printf("[FAILURE_DETECTOR] ERROR fetching nodes: %v", err)

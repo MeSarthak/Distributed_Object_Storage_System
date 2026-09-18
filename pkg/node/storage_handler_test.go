@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -272,4 +273,3 @@ func TestVerifyChecksumMismatch(t *testing.T) {
 		t.Error("expected Valid=false when checksum does not match")
 	}
 }
-

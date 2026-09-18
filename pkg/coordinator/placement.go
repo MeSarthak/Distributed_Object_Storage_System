@@ -5,27 +5,37 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 
 	"distributed-storage/pkg/config"
-	"distributed-storage/pkg/database"
 	"distributed-storage/pkg/types"
 
 	"github.com/google/uuid"
 )
 
+// NodeReader abstracts querying online storage nodes.
+type NodeReader interface {
+	GetOnlineNodes() ([]types.StorageNode, error)
+}
+
 // PlacementEngine selects the optimal storage nodes for a new replica using a
-// multi-metric weighted scoring formula.  All weights and exclusion thresholds
-// are sourced from PlacementConfig — nothing is hardcoded.
+// multi-metric weighted scoring formula or other configured placement strategies.
+// All weights and exclusion thresholds are sourced from PlacementConfig — nothing is hardcoded.
 type PlacementEngine struct {
-	nodeRepo *database.NodeRepository
-	cfg      config.PlacementConfig
+	nodeReader NodeReader
+	cfg        config.PlacementConfig
+	rrIndex    int
+	mu         sync.Mutex
 }
 
 // NewPlacementEngine constructs a PlacementEngine.
-func NewPlacementEngine(nodeRepo *database.NodeRepository, cfg config.PlacementConfig) *PlacementEngine {
+func NewPlacementEngine(nodeReader NodeReader, cfg config.PlacementConfig) *PlacementEngine {
+	if cfg.Strategy == "" {
+		cfg.Strategy = string(types.PlacementStrategyWeighted)
+	}
 	return &PlacementEngine{
-		nodeRepo: nodeRepo,
-		cfg:      cfg,
+		nodeReader: nodeReader,
+		cfg:        cfg,
 	}
 }
 
@@ -36,10 +46,10 @@ type candidateNode struct {
 }
 
 // SelectNodes returns up to `count` ONLINE storage nodes that are eligible for
-// replica placement.  Nodes whose IDs appear in `excludeNodeIDs` are skipped
-// (the failed node and any nodes already holding a replica of the object).
+// replica placement. Nodes whose IDs appear in `excludeNodeIDs` are skipped
+// (e.g. the failed node and any nodes already holding a replica of the object).
 //
-// The scoring formula for each eligible node is:
+// When strategy is "weighted" (default), the scoring formula for each eligible node is:
 //
 //	score = W_storage  * storageFreeScore
 //	      + W_cpu      * (1 - cpuUsage/100)
@@ -47,9 +57,8 @@ type candidateNode struct {
 //	      + W_latency  * latencyScore
 //	      + W_health   * 1.0          (node is ONLINE by this point)
 //
-// Where:
-//   - storageFreeScore = freeBytes / totalBytes   (clamped [0,1])
-//   - latencyScore     = 1 / (1 + latency_ms/100) (approaches 0 for high latency)
+// When strategy is "least_loaded", nodes are ranked by lowest combined (CPU + RAM).
+// When strategy is "round_robin", nodes are picked sequentially across invocations.
 //
 // Returns an error if fewer than `count` eligible nodes exist.
 func (pe *PlacementEngine) SelectNodes(
@@ -57,7 +66,11 @@ func (pe *PlacementEngine) SelectNodes(
 	count int,
 	excludeNodeIDs []uuid.UUID,
 ) ([]types.StorageNode, error) {
-	onlineNodes, err := pe.nodeRepo.GetOnlineNodes()
+	if count <= 0 {
+		return nil, fmt.Errorf("placement: count must be positive (got %d)", count)
+	}
+
+	onlineNodes, err := pe.nodeReader.GetOnlineNodes()
 	if err != nil {
 		return nil, fmt.Errorf("placement: fetch online nodes: %w", err)
 	}
@@ -104,16 +117,55 @@ func (pe *PlacementEngine) SelectNodes(
 		)
 	}
 
-	// Sort descending by score so the best nodes come first.
-	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].score > candidates[j].score
-	})
+	switch types.PlacementStrategy(pe.cfg.Strategy) {
+	case types.PlacementStrategyLeastLoaded:
+		// Sort ascending by combined CPU and RAM utilization. Tie-break by free storage descending.
+		sort.Slice(candidates, func(i, j int) bool {
+			loadI := candidates[i].node.CPUUsage + candidates[i].node.MemoryUsage
+			loadJ := candidates[j].node.CPUUsage + candidates[j].node.MemoryUsage
+			if math.Abs(loadI-loadJ) > 0.001 {
+				return loadI < loadJ
+			}
+			freeI := candidates[i].node.TotalStorage - candidates[i].node.UsedStorage
+			freeJ := candidates[j].node.TotalStorage - candidates[j].node.UsedStorage
+			return freeI > freeJ
+		})
 
-	selected := make([]types.StorageNode, count)
-	for i := 0; i < count; i++ {
-		selected[i] = candidates[i].node
+		selected := make([]types.StorageNode, count)
+		for i := 0; i < count; i++ {
+			selected[i] = candidates[i].node
+		}
+		return selected, nil
+
+	case types.PlacementStrategyRoundRobin:
+		// Sort deterministically by hostname so round-robin ordering is stable across runs.
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].node.Hostname < candidates[j].node.Hostname
+		})
+
+		pe.mu.Lock()
+		defer pe.mu.Unlock()
+
+		selected := make([]types.StorageNode, count)
+		for i := 0; i < count; i++ {
+			idx := (pe.rrIndex + i) % len(candidates)
+			selected[i] = candidates[idx].node
+		}
+		pe.rrIndex = (pe.rrIndex + count) % len(candidates)
+		return selected, nil
+
+	default:
+		// Default: Weighted scoring. Sort descending by score.
+		sort.Slice(candidates, func(i, j int) bool {
+			return candidates[i].score > candidates[j].score
+		})
+
+		selected := make([]types.StorageNode, count)
+		for i := 0; i < count; i++ {
+			selected[i] = candidates[i].node
+		}
+		return selected, nil
 	}
-	return selected, nil
 }
 
 // scoreNode computes the weighted placement score for a single node.

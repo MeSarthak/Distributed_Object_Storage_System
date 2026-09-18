@@ -51,6 +51,7 @@ type AuthConfig struct {
 }
 
 type PlacementConfig struct {
+	Strategy            string
 	WeightStorage       float64
 	WeightCPU           float64
 	WeightRAM           float64
@@ -67,6 +68,8 @@ type ReplicationConfig struct {
 	MaxReplicationFactor     int
 	HotAccessThreshold       int
 	ColdAccessThreshold      int
+	CheckIntervalSeconds     time.Duration
+	AccessWindowHours        time.Duration
 }
 
 type HeartbeatConfig struct {
@@ -104,6 +107,7 @@ func LoadCoordinatorConfig() (*CoordinatorConfig, error) {
 			BcryptCost:      getEnvInt("BCRYPT_COST", 12),
 		},
 		Placement: PlacementConfig{
+			Strategy:            getEnvStr("PLACEMENT_STRATEGY", "weighted"),
 			WeightStorage:       getEnvFloat("WEIGHT_STORAGE", 0.35),
 			WeightCPU:           getEnvFloat("WEIGHT_CPU", 0.20),
 			WeightRAM:           getEnvFloat("WEIGHT_RAM", 0.15),
@@ -119,6 +123,8 @@ func LoadCoordinatorConfig() (*CoordinatorConfig, error) {
 			MaxReplicationFactor:     getEnvInt("MAX_REPLICATION_FACTOR", 5),
 			HotAccessThreshold:       getEnvInt("HOT_ACCESS_THRESHOLD", 50),
 			ColdAccessThreshold:      getEnvInt("COLD_ACCESS_THRESHOLD", 5),
+			CheckIntervalSeconds:     time.Duration(getEnvInt("REPLICATION_CHECK_INTERVAL_SECONDS", 30)) * time.Second,
+			AccessWindowHours:        time.Duration(getEnvInt("ACCESS_WINDOW_HOURS", 24)) * time.Hour,
 		},
 		Heartbeat: HeartbeatConfig{
 			IntervalSeconds:    time.Duration(getEnvInt("HEARTBEAT_INTERVAL_SECONDS", 5)) * time.Second,
@@ -148,6 +154,16 @@ func (c *CoordinatorConfig) Validate() error {
 		return fmt.Errorf("JWT secret must be at least 16 characters long")
 	}
 
+	if c.Placement.Strategy == "" {
+		c.Placement.Strategy = "weighted"
+	}
+	switch c.Placement.Strategy {
+	case "weighted", "least_loaded", "round_robin":
+		// valid
+	default:
+		return fmt.Errorf("invalid placement strategy %q: must be 'weighted', 'least_loaded', or 'round_robin'", c.Placement.Strategy)
+	}
+
 	weightSum := c.Placement.WeightStorage + c.Placement.WeightCPU + c.Placement.WeightRAM +
 		c.Placement.WeightLatency + c.Placement.WeightHealth
 	if math.Abs(weightSum-1.0) > 0.01 {
@@ -160,6 +176,10 @@ func (c *CoordinatorConfig) Validate() error {
 
 	if c.Replication.DefaultReplicationFactor > c.Replication.MaxReplicationFactor {
 		return fmt.Errorf("default replication factor cannot exceed max replication factor")
+	}
+
+	if c.Replication.CheckIntervalSeconds <= 0 {
+		return fmt.Errorf("replication check interval must be positive")
 	}
 
 	if c.Heartbeat.TimeoutSeconds <= c.Heartbeat.IntervalSeconds {

@@ -56,12 +56,17 @@ func main() {
 	replicaRepo := database.NewReplicaRepository(db)
 	objectRepo := database.NewObjectRepository(db)
 	logRepo := database.NewLogRepository(db)
+	accessLogRepo := database.NewAccessLogRepository(db)
 
 	// 4. Initialize Core Services
 	placementEngine := coordinator.NewPlacementEngine(nodeRepo, cfg.Placement)
 	authService := auth.NewAuthService(userRepo, cfg.Auth)
 	authHandler := auth.NewAuthHandler(authService, logRepo)
 	authMiddleware := auth.AuthMiddleware(authService)
+	replicationManager := coordinator.NewReplicationManager(
+		db, accessLogRepo, objectRepo, replicaRepo, nodeRepo, logRepo,
+		placementEngine, cfg.Replication,
+	)
 
 	// 5. Initialize HTTP Router
 	router := gin.Default()
@@ -172,11 +177,14 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------------
-	// Phase 2.5 & 2.6: Background goroutines with shared cancellable context.
-	// Both goroutines are cancelled before the HTTP server shuts down so that
-	// in-flight recovery operations can complete or time out cleanly.
+	// Phase 2.4, 2.5 & 2.6: Background goroutines with shared cancellable context.
+	// Background goroutines are cancelled before the HTTP server shuts down so that
+	// in-flight operations can complete or time out cleanly.
 	// -------------------------------------------------------------------------
 	bgCtx, bgCancel := context.WithCancel(context.Background())
+
+	// Adaptive Replication Manager — dynamic replica scaling based on access frequency
+	go replicationManager.Run(bgCtx)
 
 	// Failure Detector — transitions stale nodes ONLINE → OFFLINE
 	failureDetector := coordinator.NewFailureDetector(nodeRepo, logRepo, cfg.Heartbeat)
