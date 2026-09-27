@@ -34,9 +34,14 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 		deps.NodeRepo, deps.PlacementEngine, deps.LogRepo,
 	)
 
-	readHandler := NewObjectReadHandler(
+	downloadHandler := NewObjectDownloadHandler(
 		deps.DB, deps.ObjectRepo, deps.ReplicaRepo,
 		deps.NodeRepo, deps.AccessLogRepo, deps.LogRepo,
+	)
+
+	deleteHandler := NewObjectDeleteHandler(
+		deps.DB, deps.ObjectRepo, deps.ReplicaRepo,
+		deps.NodeRepo, deps.LogRepo,
 	)
 
 	monitoringHandler := NewMonitoringHandler(
@@ -50,10 +55,10 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 	objects := router.Group("/api/objects", authMiddleware)
 	{
 		objects.POST("", uploadHandler.Upload)
-		objects.GET("/:id", readHandler.Download)
-		objects.DELETE("/:id", readHandler.Delete)
-		objects.GET("", readHandler.List)
-		objects.GET("/search", readHandler.Search)
+		objects.GET("/:id", downloadHandler.Download)
+		objects.DELETE("/:id", deleteHandler.Delete)
+		objects.GET("", downloadHandler.List)
+		objects.GET("/search", downloadHandler.Search)
 	}
 
 	// -------------------------------------------------------------------------
