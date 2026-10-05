@@ -45,7 +45,8 @@ func NewMonitoringHandler(
 }
 
 // ClusterStatus handles GET /api/cluster/status.
-// Returns aggregate cluster capacity, node counts, and overall health status.
+// Returns aggregate cluster capacity, node counts, average CPU/memory/latency,
+// storage utilisation percentage, total object count, and an overall health label.
 func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
 	nodes, err := h.nodeRepo.GetAllNodes()
 	if err != nil {
@@ -58,26 +59,47 @@ func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
 	}
 
 	var totalStorage, usedStorage int64
-	var onlineNodes, offlineNodes int
+	var onlineNodes, offlineNodes, degradedNodes int
+	var totalCPU, totalMemory, totalLatency float64
 
 	for _, node := range nodes {
 		totalStorage += node.TotalStorage
 		usedStorage += node.UsedStorage
-		if node.Status == types.NodeStatusOnline {
+		totalCPU += node.CPUUsage
+		totalMemory += node.MemoryUsage
+		totalLatency += node.Latency
+
+		switch node.Status {
+		case types.NodeStatusOnline:
 			onlineNodes++
-		} else {
+		case types.NodeStatusDegraded:
+			degradedNodes++
+		case types.NodeStatusOffline:
 			offlineNodes++
 		}
+	}
+
+	nodeCount := len(nodes)
+	var avgCPU, avgMemory, avgLatency float64
+	if nodeCount > 0 {
+		avgCPU = totalCPU / float64(nodeCount)
+		avgMemory = totalMemory / float64(nodeCount)
+		avgLatency = totalLatency / float64(nodeCount)
+	}
+
+	var storageUsedPct float64
+	if totalStorage > 0 {
+		storageUsedPct = float64(usedStorage) / float64(totalStorage) * 100.0
 	}
 
 	var totalObjects int64
 	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects").Scan(&totalObjects)
 
 	clusterHealth := "HEALTHY"
-	if offlineNodes > 0 {
+	if degradedNodes > 0 || offlineNodes > 0 {
 		clusterHealth = "DEGRADED"
 	}
-	if onlineNodes == 0 && len(nodes) > 0 {
+	if onlineNodes == 0 && nodeCount > 0 {
 		clusterHealth = "CRITICAL"
 	}
 
@@ -85,14 +107,19 @@ func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
 		Success: true,
 		Message: "Cluster status retrieved successfully",
 		Data: gin.H{
-			"status":         clusterHealth,
-			"total_nodes":    len(nodes),
-			"online_nodes":   onlineNodes,
-			"offline_nodes":  offlineNodes,
-			"total_storage":  totalStorage,
-			"used_storage":   usedStorage,
-			"total_objects":  totalObjects,
-			"timestamp":      time.Now().UTC(),
+			"status":               clusterHealth,
+			"total_nodes":          nodeCount,
+			"online_nodes":         onlineNodes,
+			"offline_nodes":        offlineNodes,
+			"degraded_nodes":       degradedNodes,
+			"total_storage_bytes":  totalStorage,
+			"used_storage_bytes":   usedStorage,
+			"storage_used_percent": fmt.Sprintf("%.2f", storageUsedPct),
+			"avg_cpu_percent":      fmt.Sprintf("%.2f", avgCPU),
+			"avg_memory_percent":   fmt.Sprintf("%.2f", avgMemory),
+			"avg_latency_ms":       fmt.Sprintf("%.2f", avgLatency),
+			"total_objects":        totalObjects,
+			"timestamp":            time.Now().UTC(),
 		},
 	})
 }
@@ -110,6 +137,9 @@ func (h *MonitoringHandler) ClusterNodes(c *gin.Context) {
 		return
 	}
 
+	if nodes == nil {
+		nodes = []types.StorageNode{}
+	}
 	c.JSON(http.StatusOK, types.StandardResponse{
 		Success: true,
 		Message: "Storage nodes retrieved successfully",
@@ -122,6 +152,7 @@ func (h *MonitoringHandler) ClusterNodes(c *gin.Context) {
 
 // SystemLogs handles GET /api/logs.
 // Returns paginated audit logs filtered by severity and event_type.
+// Query params: severity, event_type, limit (default 50), offset (default 0).
 func (h *MonitoringHandler) SystemLogs(c *gin.Context) {
 	severity := types.LogSeverity(c.Query("severity"))
 	eventType := c.Query("event_type")
@@ -130,6 +161,9 @@ func (h *MonitoringHandler) SystemLogs(c *gin.Context) {
 	offset := 0
 	if l := c.Query("limit"); l != "" {
 		if val, err := strconv.Atoi(l); err == nil && val > 0 {
+			if val > 200 {
+				val = 200
+			}
 			limit = val
 		}
 	}
@@ -149,6 +183,9 @@ func (h *MonitoringHandler) SystemLogs(c *gin.Context) {
 		return
 	}
 
+	// Fetch total count for client-side pagination — non-fatal if it fails.
+	total, _ := h.logRepo.CountLogs(severity, eventType)
+
 	if logs == nil {
 		logs = []types.SystemLog{}
 	}
@@ -157,10 +194,12 @@ func (h *MonitoringHandler) SystemLogs(c *gin.Context) {
 		Success: true,
 		Message: "System audit logs retrieved successfully",
 		Data: gin.H{
-			"logs":   logs,
-			"count":  len(logs),
-			"limit":  limit,
-			"offset": offset,
+			"logs":     logs,
+			"count":    len(logs),
+			"total":    total,
+			"limit":    limit,
+			"offset":   offset,
+			"has_more": (offset + len(logs)) < total,
 		},
 	})
 }
