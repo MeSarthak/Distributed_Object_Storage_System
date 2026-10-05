@@ -3,6 +3,7 @@ package database
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"distributed-storage/pkg/types"
 
@@ -87,4 +88,57 @@ func (r *LogRepository) GetSystemLogs(severity types.LogSeverity, eventType stri
 	}
 	return logs, rows.Err()
 }
+// CountLogs returns the total number of system log entries matching the given filters.
+// Pass empty strings to count all entries.
+// Used by /api/logs to return total count for client-side pagination.
+func (r *LogRepository) CountLogs(severity types.LogSeverity, eventType string) (int, error) {
+	query := `
+		SELECT COUNT(*)
+		FROM system_logs
+		WHERE ($1 = '' OR severity = $1)
+		  AND ($2 = '' OR event_type = $2)
+	`
+	var total int
+	err := r.db.QueryRow(query, string(severity), eventType).Scan(&total)
+	if err != nil {
+		return 0, fmt.Errorf("count system logs: %w", err)
+	}
+	return total, nil
+}
 
+// GetRecentLogs returns the most recent N log entries of a given severity (or all if empty).
+// Convenience helper for dashboard summaries.
+func (r *LogRepository) GetRecentLogs(severity types.LogSeverity, n int) ([]types.SystemLog, error) {
+	return r.GetSystemLogs(severity, "", n, 0)
+}
+
+// GetLogsBetween returns all system log entries recorded between start and end (inclusive).
+func (r *LogRepository) GetLogsBetween(start, end time.Time, limit int) ([]types.SystemLog, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	query := `
+		SELECT log_id, event_type, timestamp, description, severity, metadata::text
+		FROM system_logs
+		WHERE timestamp >= $1 AND timestamp <= $2
+		ORDER BY timestamp DESC
+		LIMIT $3
+	`
+	rows, err := r.db.Query(query, start, end, limit)
+	if err != nil {
+		return nil, fmt.Errorf("get logs between %v and %v: %w", start, end, err)
+	}
+	defer rows.Close()
+
+	var logs []types.SystemLog
+	for rows.Next() {
+		var l types.SystemLog
+		var metaStr string
+		if err := rows.Scan(&l.LogID, &l.EventType, &l.Timestamp, &l.Description, &l.Severity, &metaStr); err != nil {
+			return nil, fmt.Errorf("scan system log row: %w", err)
+		}
+		l.Metadata = metaStr
+		logs = append(logs, l)
+	}
+	return logs, rows.Err()
+}
