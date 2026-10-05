@@ -50,3 +50,41 @@ func (r *LogRepository) InsertSystemLog(
 	}
 	return nil
 }
+
+// GetSystemLogs returns paginated system logs with optional severity and event_type filters.
+func (r *LogRepository) GetSystemLogs(severity types.LogSeverity, eventType string, limit, offset int) ([]types.SystemLog, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := `
+		SELECT log_id, event_type, timestamp, description, severity, metadata::text
+		FROM system_logs
+		WHERE ($1 = '' OR severity = $1)
+		  AND ($2 = '' OR event_type = $2)
+		ORDER BY timestamp DESC
+		LIMIT $3 OFFSET $4
+	`
+	rows, err := r.db.Query(query, string(severity), eventType, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get system logs: %w", err)
+	}
+	defer rows.Close()
+
+	var logs []types.SystemLog
+	for rows.Next() {
+		var l types.SystemLog
+		var metaStr string
+		err := rows.Scan(&l.LogID, &l.EventType, &l.Timestamp, &l.Description, &l.Severity, &metaStr)
+		if err != nil {
+			return nil, fmt.Errorf("scan system log row: %w", err)
+		}
+		l.Metadata = metaStr
+		logs = append(logs, l)
+	}
+	return logs, rows.Err()
+}
+
