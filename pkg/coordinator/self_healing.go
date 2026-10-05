@@ -15,11 +15,43 @@ import (
 	"time"
 
 	"distributed-storage/pkg/config"
-	"distributed-storage/pkg/database"
 	"distributed-storage/pkg/types"
 
 	"github.com/google/uuid"
 )
+
+// Repository interfaces for SelfHealingEngine decoupling
+type TxBeginner interface {
+	Begin() (*sql.Tx, error)
+}
+
+type SelfHealingNodeRepo interface {
+	GetOfflineNodes() ([]types.StorageNode, error)
+	GetNodeByID(nodeID uuid.UUID) (*types.StorageNode, error)
+}
+
+type SelfHealingReplicaRepo interface {
+	GetReplicasByNode(nodeID uuid.UUID) ([]types.Replica, error)
+	GetReplicasByObject(objectID uuid.UUID) ([]types.Replica, error)
+	GetHealthyReplicasByObject(objectID uuid.UUID) ([]types.Replica, error)
+	CountHealthyReplicas(objectID uuid.UUID) (int, error)
+	InsertReplicaTx(tx *sql.Tx, objectID, nodeID uuid.UUID) (*types.Replica, error)
+	UpdateReplicaStatus(replicaID uuid.UUID, status types.ReplicaStatus) error
+	UpdateReplicaStatusTx(tx *sql.Tx, replicaID uuid.UUID, status types.ReplicaStatus) error
+	MarkReplicaLostTx(tx *sql.Tx, replicaID uuid.UUID) error
+}
+
+type SelfHealingObjectRepo interface {
+	GetObjectByID(objectID uuid.UUID) (*types.Object, error)
+}
+
+type SelfHealingLogRepo interface {
+	InsertSystemLog(eventType string, description string, severity types.LogSeverity, metadata map[string]string) error
+}
+
+type PlacementSelector interface {
+	SelectNodes(ctx context.Context, count int, excludeNodeIDs []uuid.UUID) ([]types.StorageNode, error)
+}
 
 // SelfHealingEngine monitors for OFFLINE nodes and automatically re-replicates
 // any objects that have fallen below their minimum replica count.
@@ -37,15 +69,18 @@ import (
 //  3. A recovered replica is only marked HEALTHY after its SHA-256 checksum
 //     has been verified against the authoritative object record.
 //
-//  4. A per-object in-progress set prevents concurrent recovery of the same
-//     object across multiple offline nodes or detection cycles.
+//  4. Source failover: If the primary healthy replica fails to stream or verify,
+//     all other healthy replicas are tried sequentially.
+//
+//  5. Target replica restoration: Recreates lost replicas up to the object's
+//     configured replication_factor (ensuring minimum replication factor is maintained).
 type SelfHealingEngine struct {
-	db          *database.DB
-	nodeRepo    *database.NodeRepository
-	replicaRepo *database.ReplicaRepository
-	objectRepo  *database.ObjectRepository
-	logRepo     *database.LogRepository
-	placement   *PlacementEngine
+	txRunner    TxBeginner
+	nodeRepo    SelfHealingNodeRepo
+	replicaRepo SelfHealingReplicaRepo
+	objectRepo  SelfHealingObjectRepo
+	logRepo     SelfHealingLogRepo
+	placement   PlacementSelector
 	replCfg     config.ReplicationConfig
 	healCfg     config.HeartbeatConfig
 
@@ -59,17 +94,17 @@ type SelfHealingEngine struct {
 
 // NewSelfHealingEngine constructs a SelfHealingEngine.
 func NewSelfHealingEngine(
-	db *database.DB,
-	nodeRepo *database.NodeRepository,
-	replicaRepo *database.ReplicaRepository,
-	objectRepo *database.ObjectRepository,
-	logRepo *database.LogRepository,
-	placement *PlacementEngine,
+	txRunner TxBeginner,
+	nodeRepo SelfHealingNodeRepo,
+	replicaRepo SelfHealingReplicaRepo,
+	objectRepo SelfHealingObjectRepo,
+	logRepo SelfHealingLogRepo,
+	placement PlacementSelector,
 	replCfg config.ReplicationConfig,
 	healCfg config.HeartbeatConfig,
 ) *SelfHealingEngine {
 	return &SelfHealingEngine{
-		db:          db,
+		txRunner:    txRunner,
 		nodeRepo:    nodeRepo,
 		replicaRepo: replicaRepo,
 		objectRepo:  objectRepo,
@@ -82,7 +117,7 @@ func NewSelfHealingEngine(
 	}
 }
 
-// Run starts the self-healing loop.  It blocks until ctx is cancelled.
+// Run starts the self-healing loop. It blocks until ctx is cancelled.
 func (she *SelfHealingEngine) Run(ctx context.Context) {
 	log.Printf("[SELF_HEALING] Starting — interval=%v", she.healCfg.SelfHealingSeconds)
 
@@ -95,13 +130,13 @@ func (she *SelfHealingEngine) Run(ctx context.Context) {
 			log.Println("[SELF_HEALING] Shutting down.")
 			return
 		case <-ticker.C:
-			she.heal(ctx)
+			she.Heal(ctx)
 		}
 	}
 }
 
-// heal performs one healing sweep across all currently OFFLINE nodes.
-func (she *SelfHealingEngine) heal(ctx context.Context) {
+// Heal performs one healing sweep across all currently OFFLINE nodes.
+func (she *SelfHealingEngine) Heal(ctx context.Context) {
 	offlineNodes, err := she.nodeRepo.GetOfflineNodes()
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR fetching offline nodes: %v", err)
@@ -119,12 +154,12 @@ func (she *SelfHealingEngine) heal(ctx context.Context) {
 			return
 		default:
 		}
-		she.healNode(ctx, node)
+		she.HealNode(ctx, node)
 	}
 }
 
-// healNode processes all replicas that were on the given offline node.
-func (she *SelfHealingEngine) healNode(ctx context.Context, failedNode types.StorageNode) {
+// HealNode processes all replicas that were on the given offline node.
+func (she *SelfHealingEngine) HealNode(ctx context.Context, failedNode types.StorageNode) {
 	replicas, err := she.replicaRepo.GetReplicasByNode(failedNode.NodeID)
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR fetching replicas for node %s: %v", failedNode.Hostname, err)
@@ -138,19 +173,22 @@ func (she *SelfHealingEngine) healNode(ctx context.Context, failedNode types.Sto
 		default:
 		}
 
-		// Only process HEALTHY or RECOVERING replicas on the failed node —
-		// replicas already LOST have no data to recover from on that node
-		// but may still reduce the healthy count and need recovery from another source.
-		she.recoverReplica(ctx, replica, failedNode)
+		// Only process replicas that are not already marked LOST on the failed node.
+		if replica.Status == types.ReplicaStatusLost {
+			continue
+		}
+
+		_, _ = she.RecoverReplica(ctx, replica, failedNode)
 	}
 }
 
-// recoverReplica attempts to restore one replica that was on a failed node.
-func (she *SelfHealingEngine) recoverReplica(
+// RecoverReplica attempts to restore one replica that was on a failed node.
+// Returns the new replica ID on success, or an error.
+func (she *SelfHealingEngine) RecoverReplica(
 	ctx context.Context,
 	lostReplica types.Replica,
 	failedNode types.StorageNode,
-) {
+) (uuid.UUID, error) {
 	objectID := lostReplica.ObjectID
 
 	// --- Deduplication guard -------------------------------------------------
@@ -158,7 +196,7 @@ func (she *SelfHealingEngine) recoverReplica(
 	if _, busy := she.inProgress[objectID]; busy {
 		she.mu.Unlock()
 		log.Printf("[SELF_HEALING] Object %s recovery already in progress — skipping duplicate trigger", objectID)
-		return
+		return uuid.Nil, fmt.Errorf("object %s recovery already in progress", objectID)
 	}
 	she.inProgress[objectID] = struct{}{}
 	she.mu.Unlock()
@@ -169,71 +207,72 @@ func (she *SelfHealingEngine) recoverReplica(
 		she.mu.Unlock()
 	}()
 
-	// --- Check current healthy replica count ---------------------------------
+	// --- Fetch object metadata (need target replication factor + checksum) ---
+	obj, err := she.objectRepo.GetObjectByID(objectID)
+	if err != nil {
+		log.Printf("[SELF_HEALING] ERROR fetching object metadata for %s: %v", objectID, err)
+		return uuid.Nil, fmt.Errorf("fetch object metadata: %w", err)
+	}
+
+	// --- Check current healthy replica count against target replication factor
 	healthyCount, err := she.replicaRepo.CountHealthyReplicas(objectID)
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR counting healthy replicas for object %s: %v", objectID, err)
-		return
-	}
-	if healthyCount >= she.replCfg.MinReplicationFactor {
-		log.Printf("[SELF_HEALING] Object %s already has %d healthy replicas (min=%d) — skipping",
-			objectID, healthyCount, she.replCfg.MinReplicationFactor)
-		return
+		return uuid.Nil, fmt.Errorf("count healthy replicas: %w", err)
 	}
 
-	log.Printf("[SELF_HEALING] Object %s has %d healthy replicas (min=%d) — starting recovery",
-		objectID, healthyCount, she.replCfg.MinReplicationFactor)
+	targetFactor := obj.ReplicationFactor
+	if targetFactor < she.replCfg.MinReplicationFactor {
+		targetFactor = she.replCfg.MinReplicationFactor
+	}
+	if targetFactor > she.replCfg.MaxReplicationFactor {
+		targetFactor = she.replCfg.MaxReplicationFactor
+	}
 
-	_ = she.logRepo.InsertSystemLog("RECOVERY_START",
+	if healthyCount >= targetFactor {
+		log.Printf("[SELF_HEALING] Object %s already has %d healthy replicas (target=%d) — skipping",
+			objectID, healthyCount, targetFactor)
+		return uuid.Nil, fmt.Errorf("object %s already has %d healthy replicas (target=%d)", objectID, healthyCount, targetFactor)
+	}
+
+	log.Printf("[SELF_HEALING] Object %s has %d healthy replicas (target=%d) — starting recovery",
+		objectID, healthyCount, targetFactor)
+
+	_ = she.logRepo.InsertSystemLog(types.EventRecoveryStart,
 		fmt.Sprintf("Starting recovery for object %s — healthy replicas: %d/%d",
-			objectID, healthyCount, she.replCfg.MinReplicationFactor),
+			objectID, healthyCount, targetFactor),
 		types.SeverityWarn,
 		map[string]string{
 			"object_id":          objectID.String(),
 			"failed_node_id":     failedNode.NodeID.String(),
 			"failed_hostname":    failedNode.Hostname,
 			"healthy_count":      fmt.Sprint(healthyCount),
-			"min_replica_factor": fmt.Sprint(she.replCfg.MinReplicationFactor),
+			"target_replication": fmt.Sprint(targetFactor),
 		},
 	)
 
-	// --- Fetch object metadata (need checksum + replication_factor) ----------
-	obj, err := she.objectRepo.GetObjectByID(objectID)
-	if err != nil {
-		log.Printf("[SELF_HEALING] ERROR fetching object metadata for %s: %v", objectID, err)
-		return
-	}
-
-	// --- Find a healthy source node ------------------------------------------
+	// --- Find healthy source replicas ----------------------------------------
 	sourceReplicas, err := she.replicaRepo.GetHealthyReplicasByObject(objectID)
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR fetching healthy source replicas for object %s: %v", objectID, err)
-		return
+		return uuid.Nil, fmt.Errorf("fetch healthy source replicas: %w", err)
 	}
 	if len(sourceReplicas) == 0 {
 		log.Printf("[SELF_HEALING] WARN: No healthy source replicas for object %s — cannot recover", objectID)
-		_ = she.logRepo.InsertSystemLog("RECOVERY_FAILED",
+		_ = she.logRepo.InsertSystemLog(types.EventRecoveryFailed,
 			fmt.Sprintf("No healthy source replicas available for object %s", objectID),
 			types.SeverityError,
 			map[string]string{"object_id": objectID.String()},
 		)
-		return
-	}
-	sourceReplica := sourceReplicas[0]
-
-	// --- Find the source node's address --------------------------------------
-	sourceNode, err := she.nodeRepo.GetNodeByID(sourceReplica.NodeID)
-	if err != nil {
-		log.Printf("[SELF_HEALING] ERROR fetching source node %s: %v", sourceReplica.NodeID, err)
-		return
+		return uuid.Nil, fmt.Errorf("no healthy source replicas available for object %s", objectID)
 	}
 
 	// --- Build exclusion list for placement ----------------------------------
-	// Exclude: the failed node + every node already holding any replica.
+	// Exclude: the failed node + every node currently holding any replica of the object.
 	allReplicas, err := she.replicaRepo.GetReplicasByObject(objectID)
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR fetching all replicas for object %s: %v", objectID, err)
-		return
+		return uuid.Nil, fmt.Errorf("fetch all replicas: %w", err)
 	}
 	excludeIDs := make([]uuid.UUID, 0, len(allReplicas)+1)
 	excludeIDs = append(excludeIDs, failedNode.NodeID)
@@ -241,63 +280,73 @@ func (she *SelfHealingEngine) recoverReplica(
 		excludeIDs = append(excludeIDs, r.NodeID)
 	}
 
-	// --- Select a destination node via the existing Placement Engine ---------
+	// --- Select a destination node via the Placement Engine ------------------
 	destinations, err := she.placement.SelectNodes(ctx, 1, excludeIDs)
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR selecting destination for object %s: %v", objectID, err)
-		_ = she.logRepo.InsertSystemLog("RECOVERY_FAILED",
+		_ = she.logRepo.InsertSystemLog(types.EventRecoveryFailed,
 			fmt.Sprintf("No eligible destination node for object %s: %v", objectID, err),
 			types.SeverityError,
 			map[string]string{"object_id": objectID.String()},
 		)
-		return
+		return uuid.Nil, fmt.Errorf("select destination node: %w", err)
 	}
 	destNode := destinations[0]
 
-	log.Printf("[SELF_HEALING] Object %s: source=%s dest=%s",
-		objectID, sourceNode.Hostname, destNode.Hostname)
+	// --- Stream object data with source failover -----------------------------
+	var objectData []byte
+	var selectedSourceNode *types.StorageNode
 
-	// --- Stream object data from source node ---------------------------------
-	objectData, err := she.fetchFromNode(ctx, *sourceNode, objectID)
-	if err != nil {
-		log.Printf("[SELF_HEALING] ERROR fetching object %s from source %s: %v",
-			objectID, sourceNode.Hostname, err)
-		_ = she.logRepo.InsertSystemLog("RECOVERY_FAILED",
-			fmt.Sprintf("Failed to fetch object %s from source node %s: %v",
-				objectID, sourceNode.Hostname, err),
+	for _, candidateReplica := range sourceReplicas {
+		sNode, err := she.nodeRepo.GetNodeByID(candidateReplica.NodeID)
+		if err != nil {
+			continue
+		}
+
+		data, err := she.fetchFromNode(ctx, *sNode, objectID)
+		if err != nil {
+			log.Printf("[SELF_HEALING] Failed to fetch object %s from source %s: %v — trying next replica",
+				objectID, sNode.Hostname, err)
+			continue
+		}
+
+		computedChecksum := sha256sum(data)
+		if computedChecksum != obj.Checksum {
+			log.Printf("[SELF_HEALING] CHECKSUM MISMATCH from source %s for object %s: expected=%s got=%s — trying next replica",
+				sNode.Hostname, objectID, obj.Checksum, computedChecksum)
+			_ = she.logRepo.InsertSystemLog(types.EventChecksumMismatch,
+				fmt.Sprintf("Checksum mismatch for object %s during recovery from %s",
+					objectID, sNode.Hostname),
+				types.SeverityCritical,
+				map[string]string{
+					"object_id":         objectID.String(),
+					"expected_checksum": obj.Checksum,
+					"computed_checksum": computedChecksum,
+					"source_node":       sNode.Hostname,
+				},
+			)
+			continue
+		}
+
+		objectData = data
+		selectedSourceNode = sNode
+		break
+	}
+
+	if selectedSourceNode == nil || len(objectData) == 0 {
+		log.Printf("[SELF_HEALING] WARN: Could not retrieve valid data for object %s from any healthy replica", objectID)
+		_ = she.logRepo.InsertSystemLog(types.EventRecoveryFailed,
+			fmt.Sprintf("Could not retrieve valid object data for %s from any healthy source replica", objectID),
 			types.SeverityError,
-			map[string]string{
-				"object_id":   objectID.String(),
-				"source_node": sourceNode.Hostname,
-			},
+			map[string]string{"object_id": objectID.String()},
 		)
-		return
+		return uuid.Nil, fmt.Errorf("could not retrieve valid object data for %s from any healthy source replica", objectID)
 	}
 
-	// --- Verify SHA-256 checksum BEFORE writing to destination ---------------
-	computedChecksum := sha256sum(objectData)
-	if computedChecksum != obj.Checksum {
-		log.Printf("[SELF_HEALING] CHECKSUM MISMATCH for object %s: expected=%s got=%s",
-			objectID, obj.Checksum, computedChecksum)
-		_ = she.logRepo.InsertSystemLog("CHECKSUM_MISMATCH",
-			fmt.Sprintf("Checksum mismatch for object %s during recovery from %s",
-				objectID, sourceNode.Hostname),
-			types.SeverityCritical,
-			map[string]string{
-				"object_id":         objectID.String(),
-				"expected_checksum": obj.Checksum,
-				"computed_checksum": computedChecksum,
-				"source_node":       sourceNode.Hostname,
-			},
-		)
-		return
-	}
-	log.Printf("[SELF_HEALING] Checksum verified for object %s (sha256=%s…)", objectID, computedChecksum[:16])
+	log.Printf("[SELF_HEALING] Object %s: retrieved from %s, pushing to dest=%s",
+		objectID, selectedSourceNode.Hostname, destNode.Hostname)
 
 	// --- Atomically update metadata: mark lost + insert recovering -----------
-	// This transaction covers BOTH the LOST transition of the failed replica AND
-	// the insertion of the new RECOVERING replica.  If the physical copy below
-	// fails, we rollback the RECOVERING record in a separate compensating tx.
 	var newReplicaID uuid.UUID
 	err = she.runInTx(func(tx *sql.Tx) error {
 		// Mark the replica on the failed node as LOST.
@@ -314,7 +363,7 @@ func (she *SelfHealingEngine) recoverReplica(
 	})
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR in metadata tx for object %s: %v", objectID, err)
-		return
+		return uuid.Nil, fmt.Errorf("metadata tx failed: %w", err)
 	}
 
 	// --- Push object data to destination node --------------------------------
@@ -325,7 +374,7 @@ func (she *SelfHealingEngine) recoverReplica(
 		// Compensate: mark the new RECOVERING replica LOST so metadata stays consistent.
 		_ = she.replicaRepo.UpdateReplicaStatus(newReplicaID, types.ReplicaStatusLost)
 
-		_ = she.logRepo.InsertSystemLog("RECOVERY_FAILED",
+		_ = she.logRepo.InsertSystemLog(types.EventRecoveryFailed,
 			fmt.Sprintf("Failed to push object %s to destination node %s: %v",
 				objectID, destNode.Hostname, err),
 			types.SeverityError,
@@ -334,7 +383,7 @@ func (she *SelfHealingEngine) recoverReplica(
 				"dest_node": destNode.Hostname,
 			},
 		)
-		return
+		return uuid.Nil, fmt.Errorf("push to destination node failed: %w", err)
 	}
 
 	// --- Mark replica HEALTHY inside its own transaction ---------------------
@@ -343,19 +392,19 @@ func (she *SelfHealingEngine) recoverReplica(
 	})
 	if err != nil {
 		log.Printf("[SELF_HEALING] ERROR finalizing replica %s as HEALTHY: %v", newReplicaID, err)
-		_ = she.logRepo.InsertSystemLog("RECOVERY_FAILED",
+		_ = she.logRepo.InsertSystemLog(types.EventRecoveryFailed,
 			fmt.Sprintf("Could not finalize replica %s as HEALTHY for object %s: %v",
 				newReplicaID, objectID, err),
 			types.SeverityError,
 			map[string]string{"object_id": objectID.String(), "replica_id": newReplicaID.String()},
 		)
-		return
+		return uuid.Nil, fmt.Errorf("finalize replica healthy: %w", err)
 	}
 
 	log.Printf("[SELF_HEALING] Recovery SUCCESS: object %s replica %s now HEALTHY on %s",
 		objectID, newReplicaID, destNode.Hostname)
 
-	_ = she.logRepo.InsertSystemLog("RECOVERY_SUCCESS",
+	_ = she.logRepo.InsertSystemLog(types.EventRecoverySuccess,
 		fmt.Sprintf("Object %s successfully recovered to node %s (replica %s)",
 			objectID, destNode.Hostname, newReplicaID),
 		types.SeverityInfo,
@@ -363,17 +412,22 @@ func (she *SelfHealingEngine) recoverReplica(
 			"object_id":   objectID.String(),
 			"replica_id":  newReplicaID.String(),
 			"dest_node":   destNode.Hostname,
-			"source_node": sourceNode.Hostname,
-			"checksum":    computedChecksum,
+			"source_node": selectedSourceNode.Hostname,
+			"checksum":    obj.Checksum,
 		},
 	)
+
+	return newReplicaID, nil
 }
 
 // --- helpers -----------------------------------------------------------------
 
 // runInTx starts a transaction, calls fn, commits on success, rolls back on error.
 func (she *SelfHealingEngine) runInTx(fn func(*sql.Tx) error) error {
-	tx, err := she.db.Begin()
+	if she.txRunner == nil {
+		return fn(nil)
+	}
+	tx, err := she.txRunner.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
@@ -385,17 +439,8 @@ func (she *SelfHealingEngine) runInTx(fn func(*sql.Tx) error) error {
 }
 
 // buildNodeURL constructs the base internal URL for a storage node.
-// Node port is stored in the config but is not in the StorageNode struct;
-// we derive it from the node's hostname using the docker-compose naming convention.
-// Storage nodes expose their API on the port stored during heartbeat registration.
-// Since StorageNode does not carry a port field (the schema stores ip_address only),
-// we use the coordinator's configured internal port (default 9001) here.
-// In a production system the port would be stored in storage_nodes.
 func buildNodeURL(node types.StorageNode) string {
-	// The storage-node containers listen on port 9001 (their NODE_PORT env var).
-	// We use docker-compose service names as hostnames and assume the default port.
-	// If a non-default port is required this can be extended to include port in StorageNode.
-	return fmt.Sprintf("http://%s:9001", node.Hostname)
+	return BuildNodeURL(node)
 }
 
 // fetchFromNode GETs the raw object bytes from a source storage node.

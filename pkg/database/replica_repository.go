@@ -109,6 +109,9 @@ func (r *ReplicaRepository) InsertReplica(objectID, nodeID uuid.UUID) (*types.Re
 
 // InsertReplicaTx creates a new RECOVERING replica within an existing transaction.
 func (r *ReplicaRepository) InsertReplicaTx(tx *sql.Tx, objectID, nodeID uuid.UUID) (*types.Replica, error) {
+	if tx == nil {
+		return r.InsertReplica(objectID, nodeID)
+	}
 	query := `
 		INSERT INTO replicas (replica_id, object_id, node_id, status, created_at)
 		VALUES ($1, $2, $3, 'RECOVERING', NOW())
@@ -139,6 +142,9 @@ func (r *ReplicaRepository) UpdateReplicaStatus(replicaID uuid.UUID, status type
 
 // UpdateReplicaStatusTx changes replica status inside an existing transaction.
 func (r *ReplicaRepository) UpdateReplicaStatusTx(tx *sql.Tx, replicaID uuid.UUID, status types.ReplicaStatus) error {
+	if tx == nil {
+		return r.UpdateReplicaStatus(replicaID, status)
+	}
 	query := `UPDATE replicas SET status = $2 WHERE replica_id = $1`
 	res, err := tx.Exec(query, replicaID, status)
 	if err != nil {
@@ -158,7 +164,80 @@ func (r *ReplicaRepository) MarkReplicaLost(replicaID uuid.UUID) error {
 
 // MarkReplicaLostTx marks a replica LOST inside an existing transaction.
 func (r *ReplicaRepository) MarkReplicaLostTx(tx *sql.Tx, replicaID uuid.UUID) error {
+	if tx == nil {
+		return r.MarkReplicaLost(replicaID)
+	}
 	return r.UpdateReplicaStatusTx(tx, replicaID, types.ReplicaStatusLost)
+}
+
+// DeleteReplica physically deletes a replica record from the database.
+func (r *ReplicaRepository) DeleteReplica(replicaID uuid.UUID) error {
+	query := `DELETE FROM replicas WHERE replica_id = $1`
+	res, err := r.db.Exec(query, replicaID)
+	if err != nil {
+		return fmt.Errorf("delete replica %s: %w", replicaID, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("replica %s not found for deletion", replicaID)
+	}
+	return nil
+}
+
+// DeleteReplicaTx physically deletes a replica record inside an existing transaction.
+func (r *ReplicaRepository) DeleteReplicaTx(tx *sql.Tx, replicaID uuid.UUID) error {
+	query := `DELETE FROM replicas WHERE replica_id = $1`
+	res, err := tx.Exec(query, replicaID)
+	if err != nil {
+		return fmt.Errorf("tx delete replica %s: %w", replicaID, err)
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("replica %s not found in tx deletion", replicaID)
+	}
+	return nil
+}
+
+// DeleteReplicasByObject removes all replica records belonging to an object.
+func (r *ReplicaRepository) DeleteReplicasByObject(objectID uuid.UUID) error {
+	query := `DELETE FROM replicas WHERE object_id = $1`
+	_, err := r.db.Exec(query, objectID)
+	if err != nil {
+		return fmt.Errorf("delete replicas for object %s: %w", objectID, err)
+	}
+	return nil
+}
+
+// InsertHealthyReplica creates a replica in HEALTHY status directly.
+func (r *ReplicaRepository) InsertHealthyReplica(objectID, nodeID uuid.UUID) (*types.Replica, error) {
+	query := `
+		INSERT INTO replicas (replica_id, object_id, node_id, status, created_at)
+		VALUES ($1, $2, $3, 'HEALTHY', NOW())
+		RETURNING replica_id, object_id, node_id, status, created_at
+	`
+	replicaID := uuid.New()
+	row := r.db.QueryRow(query, replicaID, objectID, nodeID)
+	replica, err := scanReplicaRow(row)
+	if err != nil {
+		return nil, fmt.Errorf("insert healthy replica for object %s on node %s: %w", objectID, nodeID, err)
+	}
+	return replica, nil
+}
+
+// InsertHealthyReplicaTx creates a replica in HEALTHY status within a transaction.
+func (r *ReplicaRepository) InsertHealthyReplicaTx(tx *sql.Tx, objectID, nodeID uuid.UUID) (*types.Replica, error) {
+	query := `
+		INSERT INTO replicas (replica_id, object_id, node_id, status, created_at)
+		VALUES ($1, $2, $3, 'HEALTHY', NOW())
+		RETURNING replica_id, object_id, node_id, status, created_at
+	`
+	replicaID := uuid.New()
+	row := tx.QueryRow(query, replicaID, objectID, nodeID)
+	replica, err := scanReplicaRow(row)
+	if err != nil {
+		return nil, fmt.Errorf("tx insert healthy replica for object %s on node %s: %w", objectID, nodeID, err)
+	}
+	return replica, nil
 }
 
 // --- internal scan helpers ---------------------------------------------------

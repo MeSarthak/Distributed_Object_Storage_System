@@ -38,6 +38,23 @@ func TestCoordinatorConfigDefaultsAndValidation(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected error when JWT secret is shorter than 16 chars, got nil")
 	}
+
+	// Test invalid placement strategy
+	t.Setenv("JWT_SECRET", "super-secret-jwt-key-change-in-production-min-32-chars")
+	t.Setenv("PLACEMENT_STRATEGY", "invalid_strategy")
+	_, err = LoadCoordinatorConfig()
+	if err == nil {
+		t.Errorf("expected error for invalid placement strategy, got nil")
+	}
+
+	// Test invalid replication check interval
+	t.Setenv("PLACEMENT_STRATEGY", "weighted")
+	t.Setenv("REPLICATION_CHECK_INTERVAL_SECONDS", "0")
+	_, err = LoadCoordinatorConfig()
+	if err == nil {
+		t.Errorf("expected error for non-positive check interval, got nil")
+	}
+	os.Unsetenv("REPLICATION_CHECK_INTERVAL_SECONDS")
 }
 
 func TestStorageNodeConfigDefaultsAndValidation(t *testing.T) {

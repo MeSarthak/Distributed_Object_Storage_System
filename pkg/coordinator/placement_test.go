@@ -14,13 +14,12 @@ import (
 // Test doubles (in-memory fakes) for the placement engine tests
 // ---------------------------------------------------------------------------
 
-// fakeNodeRepo is an in-memory implementation of the node query surface used
-// by PlacementEngine.  It avoids any dependency on a live PostgreSQL instance.
-type fakeNodeRepo struct {
+// fakeNodeReader implements NodeReader for unit tests without PostgreSQL.
+type fakeNodeReader struct {
 	nodes []types.StorageNode
 }
 
-func (f *fakeNodeRepo) GetOnlineNodes() ([]types.StorageNode, error) {
+func (f *fakeNodeReader) GetOnlineNodes() ([]types.StorageNode, error) {
 	var online []types.StorageNode
 	for _, n := range f.nodes {
 		if n.Status == types.NodeStatusOnline {
@@ -28,89 +27,6 @@ func (f *fakeNodeRepo) GetOnlineNodes() ([]types.StorageNode, error) {
 		}
 	}
 	return online, nil
-}
-
-// fakePlacementNodeRepo bridges fakeNodeRepo to NodeRepository by embedding it
-// in a struct that PlacementEngine can accept.  Since PlacementEngine operates
-// on *database.NodeRepository which has concrete methods, we test through a
-// helper that calls the same scoring logic.
-//
-// Rather than extracting an interface (which would require modifying existing
-// types), the placement tests are structured to call scoreNode directly and
-// validate SelectNodes with a custom sub-type.
-
-// testPlacementEngine wraps PlacementEngine with a fake node source for tests.
-type testPlacementEngine struct {
-	nodes  []types.StorageNode
-	cfg    config.PlacementConfig
-	engine *PlacementEngine // actual engine with real scoring logic
-}
-
-func newTestPlacementEngine(nodes []types.StorageNode, cfg config.PlacementConfig) *testPlacementEngine {
-	return &testPlacementEngine{nodes: nodes, cfg: cfg}
-}
-
-// selectNodes mirrors PlacementEngine.SelectNodes but uses the in-memory node list.
-func (tpe *testPlacementEngine) selectNodes(ctx context.Context, count int, excludeIDs []uuid.UUID) ([]types.StorageNode, error) {
-	// Reuse real scoring logic by creating a temporary PlacementEngine with no
-	// node repo and calling scoreNode directly.
-	eng := &PlacementEngine{cfg: tpe.cfg}
-
-	excluded := make(map[uuid.UUID]struct{}, len(excludeIDs))
-	for _, id := range excludeIDs {
-		excluded[id] = struct{}{}
-	}
-
-	type scored struct {
-		node  types.StorageNode
-		score float64
-	}
-
-	var candidates []scored
-	for _, node := range tpe.nodes {
-		if node.Status != types.NodeStatusOnline {
-			continue
-		}
-		if _, skip := excluded[node.NodeID]; skip {
-			continue
-		}
-		if node.CPUUsage > tpe.cfg.MaxCPUThreshold {
-			continue
-		}
-		if node.MemoryUsage > tpe.cfg.MaxRAMThreshold {
-			continue
-		}
-		freeBytes := node.TotalStorage - node.UsedStorage
-		if freeBytes < tpe.cfg.MinFreeStorageBytes {
-			continue
-		}
-		candidates = append(candidates, scored{node: node, score: eng.scoreNode(node)})
-	}
-
-	if len(candidates) < count {
-		return nil, &insufficientNodesError{need: count, have: len(candidates)}
-	}
-
-	// Sort descending.
-	for i := 0; i < len(candidates)-1; i++ {
-		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].score > candidates[i].score {
-				candidates[i], candidates[j] = candidates[j], candidates[i]
-			}
-		}
-	}
-
-	result := make([]types.StorageNode, count)
-	for i := 0; i < count; i++ {
-		result[i] = candidates[i].node
-	}
-	return result, nil
-}
-
-type insufficientNodesError struct{ need, have int }
-
-func (e *insufficientNodesError) Error() string {
-	return "insufficient nodes"
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +70,7 @@ func threeNodeCluster() []types.StorageNode {
 
 func defaultPlacementCfg() config.PlacementConfig {
 	return config.PlacementConfig{
+		Strategy:            string(types.PlacementStrategyWeighted),
 		WeightStorage:       0.35,
 		WeightCPU:           0.20,
 		WeightRAM:           0.15,
@@ -166,7 +83,7 @@ func defaultPlacementCfg() config.PlacementConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests running directly against production PlacementEngine
 // ---------------------------------------------------------------------------
 
 // TestPlacementSelectsHealthyNodes verifies that SelectNodes returns online
@@ -176,8 +93,8 @@ func TestPlacementSelectsHealthyNodes(t *testing.T) {
 	// Make node-2 offline.
 	nodes[1].Status = types.NodeStatusOffline
 
-	tpe := newTestPlacementEngine(nodes, defaultPlacementCfg())
-	selected, err := tpe.selectNodes(context.Background(), 2, nil)
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, defaultPlacementCfg())
+	selected, err := engine.SelectNodes(context.Background(), 2, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -197,8 +114,8 @@ func TestPlacementExcludesOfflineNode(t *testing.T) {
 	nodes := threeNodeCluster()
 	excludeID := nodes[0].NodeID // node-1
 
-	tpe := newTestPlacementEngine(nodes, defaultPlacementCfg())
-	selected, err := tpe.selectNodes(context.Background(), 1, []uuid.UUID{excludeID})
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, defaultPlacementCfg())
+	selected, err := engine.SelectNodes(context.Background(), 1, []uuid.UUID{excludeID})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -217,9 +134,9 @@ func TestPlacementExcludesCPUOverloadedNode(t *testing.T) {
 	nodes[1].CPUUsage = 95.0
 
 	cfg := defaultPlacementCfg()
-	tpe := newTestPlacementEngine(nodes, cfg)
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, cfg)
 
-	selected, err := tpe.selectNodes(context.Background(), 2, nil)
+	selected, err := engine.SelectNodes(context.Background(), 2, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -237,8 +154,8 @@ func TestPlacementExcludesLowStorageNode(t *testing.T) {
 	// Fill node-1 nearly completely.
 	nodes[0].UsedStorage = nodes[0].TotalStorage - 1024 // only 1 KB free
 
-	tpe := newTestPlacementEngine(nodes, defaultPlacementCfg())
-	selected, err := tpe.selectNodes(context.Background(), 2, nil)
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, defaultPlacementCfg())
+	selected, err := engine.SelectNodes(context.Background(), 2, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -256,15 +173,15 @@ func TestPlacementInsufficientNodes(t *testing.T) {
 	// Exclude all nodes.
 	excludeIDs := []uuid.UUID{nodes[0].NodeID, nodes[1].NodeID, nodes[2].NodeID}
 
-	tpe := newTestPlacementEngine(nodes, defaultPlacementCfg())
-	_, err := tpe.selectNodes(context.Background(), 1, excludeIDs)
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, defaultPlacementCfg())
+	_, err := engine.SelectNodes(context.Background(), 1, excludeIDs)
 	if err == nil {
 		t.Error("expected error when no eligible nodes remain")
 	}
 }
 
 // TestPlacementScoring verifies that the scoring formula uses the configured
-// weights.  A node with lower CPU, lower memory and more free space should
+// weights. A node with lower CPU, lower memory and more free space should
 // outscore a node with higher resource utilisation.
 func TestPlacementScoring(t *testing.T) {
 	eng := &PlacementEngine{cfg: defaultPlacementCfg()}
@@ -301,8 +218,8 @@ func TestPlacementExcludesMultipleNodes(t *testing.T) {
 	// Exclude node-1 and node-3; only node-2 should be left.
 	excludeIDs := []uuid.UUID{nodes[0].NodeID, nodes[2].NodeID}
 
-	tpe := newTestPlacementEngine(nodes, defaultPlacementCfg())
-	selected, err := tpe.selectNodes(context.Background(), 1, excludeIDs)
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, defaultPlacementCfg())
+	selected, err := engine.SelectNodes(context.Background(), 1, excludeIDs)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -311,5 +228,64 @@ func TestPlacementExcludesMultipleNodes(t *testing.T) {
 	}
 	if selected[0].NodeID != nodes[1].NodeID {
 		t.Errorf("expected node-2, got %s", selected[0].Hostname)
+	}
+}
+
+// TestPlacementStrategyLeastLoaded verifies that least_loaded strategy selects
+// the node with minimal combined CPU and memory load.
+func TestPlacementStrategyLeastLoaded(t *testing.T) {
+	nodes := threeNodeCluster()
+	// node-1: CPU 20 + Mem 30 = 50
+	// node-2: CPU 50 + Mem 60 = 110
+	// node-3: CPU 15 + Mem 20 = 35 -> least loaded!
+
+	cfg := defaultPlacementCfg()
+	cfg.Strategy = string(types.PlacementStrategyLeastLoaded)
+
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, cfg)
+	selected, err := engine.SelectNodes(context.Background(), 1, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(selected) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(selected))
+	}
+	if selected[0].NodeID != nodes[2].NodeID {
+		t.Errorf("expected node-3 (least loaded), got %s", selected[0].Hostname)
+	}
+}
+
+// TestPlacementStrategyRoundRobin verifies that round_robin strategy distributes
+// node selection sequentially across calls.
+func TestPlacementStrategyRoundRobin(t *testing.T) {
+	nodes := threeNodeCluster()
+	// Node hostnames: node-1, node-2, node-3
+
+	cfg := defaultPlacementCfg()
+	cfg.Strategy = string(types.PlacementStrategyRoundRobin)
+
+	engine := NewPlacementEngine(&fakeNodeReader{nodes: nodes}, cfg)
+
+	first, err := engine.SelectNodes(context.Background(), 1, nil)
+	if err != nil {
+		t.Fatalf("first select failed: %v", err)
+	}
+	second, err := engine.SelectNodes(context.Background(), 1, nil)
+	if err != nil {
+		t.Fatalf("second select failed: %v", err)
+	}
+	third, err := engine.SelectNodes(context.Background(), 1, nil)
+	if err != nil {
+		t.Fatalf("third select failed: %v", err)
+	}
+
+	if first[0].Hostname != "node-1" {
+		t.Errorf("expected first round-robin to be node-1, got %s", first[0].Hostname)
+	}
+	if second[0].Hostname != "node-2" {
+		t.Errorf("expected second round-robin to be node-2, got %s", second[0].Hostname)
+	}
+	if third[0].Hostname != "node-3" {
+		t.Errorf("expected third round-robin to be node-3, got %s", third[0].Hostname)
 	}
 }

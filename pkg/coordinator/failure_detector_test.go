@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -83,61 +84,6 @@ func (f *fakeDetectorLogRepo) countByEventType(et string) int {
 }
 
 // ---------------------------------------------------------------------------
-// Inline FailureDetector wired to fakes
-// ---------------------------------------------------------------------------
-// The production FailureDetector depends on *database.NodeRepository and
-// *database.LogRepository (concrete types).  To keep tests self-contained
-// without modifying those types, we duplicate the detector logic here via a
-// testableDetector struct that accepts interfaces.  This mirrors the detector's
-// behaviour faithfully and validates the state machine independently.
-
-type detectorNodeRepo interface {
-	GetAllNodes() ([]types.StorageNode, error)
-	MarkNodeOffline(uuid.UUID) error
-}
-type detectorLogRepo interface {
-	InsertSystemLog(string, string, types.LogSeverity, map[string]string) error
-}
-
-type testableDetector struct {
-	nodeRepo       detectorNodeRepo
-	logRepo        detectorLogRepo
-	cfg            config.HeartbeatConfig
-	alreadyOffline map[uuid.UUID]struct{}
-	mu             sync.Mutex
-}
-
-func newTestableDetector(nr detectorNodeRepo, lr detectorLogRepo, cfg config.HeartbeatConfig) *testableDetector {
-	return &testableDetector{
-		nodeRepo:       nr,
-		logRepo:        lr,
-		cfg:            cfg,
-		alreadyOffline: make(map[uuid.UUID]struct{}),
-	}
-}
-
-func (td *testableDetector) detect() {
-	nodes, _ := td.nodeRepo.GetAllNodes()
-	now := time.Now()
-	td.mu.Lock()
-	defer td.mu.Unlock()
-	for _, node := range nodes {
-		timedOut := now.Sub(node.LastHeartbeat) > td.cfg.TimeoutSeconds
-		switch {
-		case node.Status == types.NodeStatusOnline && timedOut:
-			_ = td.nodeRepo.MarkNodeOffline(node.NodeID)
-			td.alreadyOffline[node.NodeID] = struct{}{}
-			_ = td.logRepo.InsertSystemLog("NODE_FAILURE", "node "+node.Hostname+" offline",
-				types.SeverityCritical, map[string]string{"node_id": node.NodeID.String()})
-		case node.Status == types.NodeStatusOnline && !timedOut:
-			if _, was := td.alreadyOffline[node.NodeID]; was {
-				delete(td.alreadyOffline, node.NodeID)
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Helper: build a node
 // ---------------------------------------------------------------------------
 
@@ -159,7 +105,7 @@ func heartbeatCfg() config.HeartbeatConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests running directly against production FailureDetector
 // ---------------------------------------------------------------------------
 
 // TestHeartbeatUpdate verifies that a fresh heartbeat keeps a node ONLINE.
@@ -167,9 +113,9 @@ func TestHeartbeatUpdate(t *testing.T) {
 	node := onlineNode("10000000-0000-0000-0000-000000000001", time.Now())
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
-	td.detect()
+	fd.Detect(context.Background())
 
 	nodes, _ := nodeRepo.GetAllNodes()
 	for _, n := range nodes {
@@ -187,9 +133,9 @@ func TestHeartbeatTimeout(t *testing.T) {
 	node := onlineNode("20000000-0000-0000-0000-000000000001", staleTime)
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
-	td.detect()
+	fd.Detect(context.Background())
 
 	nodes, _ := nodeRepo.GetAllNodes()
 	found := false
@@ -212,7 +158,7 @@ func TestOnlineToOfflineTransition(t *testing.T) {
 	node := onlineNode("30000000-0000-0000-0000-000000000001", staleTime)
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
 	// Before detect: ONLINE
 	nodesBeforeSlice, _ := nodeRepo.GetAllNodes()
@@ -222,7 +168,7 @@ func TestOnlineToOfflineTransition(t *testing.T) {
 		}
 	}
 
-	td.detect()
+	fd.Detect(context.Background())
 
 	// After detect: OFFLINE
 	nodesAfter, _ := nodeRepo.GetAllNodes()
@@ -240,9 +186,9 @@ func TestFailureLogging(t *testing.T) {
 	node := onlineNode("40000000-0000-0000-0000-000000000001", staleTime)
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
-	td.detect()
+	fd.Detect(context.Background())
 
 	count := logRepo.countByEventType("NODE_FAILURE")
 	if count != 1 {
@@ -257,11 +203,11 @@ func TestNoRepeatedFailureLog(t *testing.T) {
 	node := onlineNode("50000000-0000-0000-0000-000000000001", staleTime)
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
 	// Run detect 5 times simulating 5 polling cycles.
 	for i := 0; i < 5; i++ {
-		td.detect()
+		fd.Detect(context.Background())
 	}
 
 	count := logRepo.countByEventType("NODE_FAILURE")
@@ -282,11 +228,11 @@ func TestAlreadyOfflineNodeSkipped(t *testing.T) {
 	}
 	nodeRepo := newFakeDetectorNodeRepo(node)
 	logRepo := &fakeDetectorLogRepo{}
-	td := newTestableDetector(nodeRepo, logRepo, heartbeatCfg())
+	fd := NewFailureDetector(nodeRepo, logRepo, heartbeatCfg())
 
 	// Three cycles.
 	for i := 0; i < 3; i++ {
-		td.detect()
+		fd.Detect(context.Background())
 	}
 
 	count := logRepo.countByEventType("NODE_FAILURE")
