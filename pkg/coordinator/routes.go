@@ -49,6 +49,11 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 		deps.ReplicaRepo, deps.LogRepo, deps.AccessLogRepo,
 	)
 
+	metadataHandler := NewMetadataHandler(
+		deps.ObjectRepo, deps.NodeRepo,
+		deps.ReplicaRepo, deps.AccessLogRepo,
+	)
+
 	// -------------------------------------------------------------------------
 	// 3.2 Object APIs (Protected with JWT)
 	// -------------------------------------------------------------------------
@@ -65,15 +70,18 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 	// 3.3 Metadata APIs (Protected with JWT)
 	// -------------------------------------------------------------------------
 	router.GET("/api/metadata/:id", authMiddleware, monitoringHandler.Metadata)
-
+	router.GET("/api/metadata/:id", authMiddleware, metadataHandler.GetObjectMetadata)
+	
 	// -------------------------------------------------------------------------
 	// 3.5 Monitoring & Admin APIs (Protected with JWT + Role ADMIN)
 	// -------------------------------------------------------------------------
 	cluster := router.Group("/api/cluster", authMiddleware)
 	{
 		// Cluster status is visible to all authenticated users
-		cluster.GET("/status", monitoringHandler.ClusterStatus)
-		// Detailed hardware node metrics require ADMIN role
+		// cluster.GET("/status", monitoringHandler.ClusterStatus)
+		
+		// Both cluster endpoints require ADMIN role per spec
+		cluster.GET("/status", adminMiddleware, monitoringHandler.ClusterStatus)
 		cluster.GET("/nodes", adminMiddleware, monitoringHandler.ClusterNodes)
 	}
 
