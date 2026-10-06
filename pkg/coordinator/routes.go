@@ -1,0 +1,92 @@
+package coordinator
+
+import (
+	"distributed-storage/pkg/auth"
+	"distributed-storage/pkg/database"
+	"distributed-storage/pkg/types"
+
+	"github.com/gin-gonic/gin"
+)
+
+// APIDependencies bundles the database repositories and services required by
+// all Phase 3 API handlers.
+type APIDependencies struct {
+	DB              *database.DB
+	UserRepo        *database.UserRepository
+	NodeRepo        *database.NodeRepository
+	ReplicaRepo     *database.ReplicaRepository
+	ObjectRepo      *database.ObjectRepository
+	LogRepo         *database.LogRepository
+	AccessLogRepo   *database.AccessLogRepository
+	PlacementEngine *PlacementEngine
+	AuthService     *auth.AuthService
+}
+
+// RegisterAPIRoutes mounts all Phase 3 endpoints onto the Gin router with appropriate
+// middleware protections (JWT authentication and Role-Based Access Control).
+func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
+	authMiddleware := auth.AuthMiddleware(deps.AuthService)
+	adminMiddleware := auth.RequireRole(types.RoleAdmin)
+
+	// Initialize modular handlers
+	uploadHandler := NewObjectUploadHandler(
+		deps.DB, deps.ObjectRepo, deps.ReplicaRepo,
+		deps.NodeRepo, deps.PlacementEngine, deps.LogRepo,
+	)
+
+	downloadHandler := NewObjectDownloadHandler(
+		deps.DB, deps.ObjectRepo, deps.ReplicaRepo,
+		deps.NodeRepo, deps.AccessLogRepo, deps.LogRepo,
+	)
+
+	deleteHandler := NewObjectDeleteHandler(
+		deps.DB, deps.ObjectRepo, deps.ReplicaRepo,
+		deps.NodeRepo, deps.LogRepo,
+	)
+
+	monitoringHandler := NewMonitoringHandler(
+		deps.DB, deps.NodeRepo, deps.ObjectRepo,
+		deps.ReplicaRepo, deps.LogRepo, deps.AccessLogRepo,
+	)
+
+	metadataHandler := NewMetadataHandler(
+		deps.ObjectRepo, deps.NodeRepo,
+		deps.ReplicaRepo, deps.AccessLogRepo,
+	)
+
+	// -------------------------------------------------------------------------
+	// 3.2 Object APIs (Protected with JWT)
+	// /search must be registered before /:id — httprouter panics if a static
+	// segment follows a wildcard under the same prefix.
+	// -------------------------------------------------------------------------
+	objects := router.Group("/api/objects", authMiddleware)
+	{
+		objects.POST("", uploadHandler.Upload)
+		objects.GET("", downloadHandler.List)
+		objects.GET("/search", downloadHandler.Search)
+		objects.GET("/:id", downloadHandler.Download)
+		objects.DELETE("/:id", deleteHandler.Delete)
+	}
+
+	// -------------------------------------------------------------------------
+	// 3.3 Metadata APIs (Protected with JWT)
+	// One handler per route. MetadataHandler owns this endpoint.
+	// -------------------------------------------------------------------------
+	router.GET("/api/metadata/:id", authMiddleware, metadataHandler.GetObjectMetadata)
+	
+	// -------------------------------------------------------------------------
+	// 3.5 Monitoring & Admin APIs (Protected with JWT + Role ADMIN)
+	// -------------------------------------------------------------------------
+	cluster := router.Group("/api/cluster", authMiddleware)
+	{
+		// Cluster status is visible to all authenticated users
+		// cluster.GET("/status", monitoringHandler.ClusterStatus)
+		
+		// Both cluster endpoints require ADMIN role per spec
+		cluster.GET("/status", adminMiddleware, monitoringHandler.ClusterStatus)
+		cluster.GET("/nodes", adminMiddleware, monitoringHandler.ClusterNodes)
+	}
+
+	// Audit logs require ADMIN role
+	router.GET("/api/logs", authMiddleware, adminMiddleware, monitoringHandler.SystemLogs)
+}

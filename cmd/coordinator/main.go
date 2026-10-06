@@ -98,32 +98,26 @@ func main() {
 		})
 	})
 
-	router.GET("/api/cluster/status", func(c *gin.Context) {
-		// Cluster status summary (will be populated with live node metrics in Phase 2/3)
-		var totalNodes, onlineNodes int
-		_ = db.QueryRow("SELECT COUNT(*) FROM storage_nodes").Scan(&totalNodes)
-		_ = db.QueryRow("SELECT COUNT(*) FROM storage_nodes WHERE status = 'ONLINE'").Scan(&onlineNodes)
-
-		var totalObjects int64
-		_ = db.QueryRow("SELECT COUNT(*) FROM objects").Scan(&totalObjects)
-
-		c.JSON(http.StatusOK, types.StandardResponse{
-			Success: true,
-			Message: "Cluster status retrieved successfully",
-			Data: gin.H{
-				"cluster_status": "HEALTHY",
-				"total_nodes":    totalNodes,
-				"online_nodes":   onlineNodes,
-				"total_objects":  totalObjects,
-				"timestamp":      time.Now().UTC(),
-			},
-		})
-	})
-
 	// -------------------------------------------------------------------------
 	// Phase 2.1: Authentication APIs
 	// -------------------------------------------------------------------------
 	authHandler.RegisterRoutes(router, authMiddleware)
+
+	// -------------------------------------------------------------------------
+	// Phase 3: Object, Metadata, and Monitoring APIs
+	// -------------------------------------------------------------------------
+	coordinator.RegisterAPIRoutes(router, &coordinator.APIDependencies{
+		DB:              db,
+		UserRepo:        userRepo,
+		NodeRepo:        nodeRepo,
+		ReplicaRepo:     replicaRepo,
+		ObjectRepo:      objectRepo,
+		LogRepo:         logRepo,
+		AccessLogRepo:   accessLogRepo,
+		PlacementEngine: placementEngine,
+		AuthService:     authService,
+	})
+
 
 	// -------------------------------------------------------------------------
 	// Phase 2.5: Heartbeat receiver endpoint

@@ -93,11 +93,11 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [x] 2.6 Self-Healing System - Automatic replica recovery on node failure with atomic updates
 
 ### Phase 3: API Endpoints
-- [ ] 3.1 Authentication APIs - register, login, validate
-- [ ] 3.2 Object APIs - upload (multipart, placement, replicate to $K$ nodes, checksum, DB), download (replica fallback, stream, verify checksum, log access), delete (purge across all replicas, DB delete), search (filter by name/query)
-- [ ] 3.3 Metadata APIs - lookup (`/api/metadata/:id` with replica details)
-- [ ] 3.4 Storage Node internal APIs - chunk store, stream, verify, delete, heartbeat
-- [ ] 3.5 Monitoring APIs - cluster status (`/api/cluster/status`), node list with metrics (`/api/cluster/nodes`), system audit logs (`/api/logs`)
+- [x] 3.1 Authentication APIs - register, login, validate
+- [x] 3.2 Object APIs - upload (multipart, placement, replicate to $K$ nodes, checksum, DB), download (replica fallback, stream, verify checksum, log access), delete (purge across all replicas, DB delete), search (filter by name/query)
+- [x] 3.3 Metadata APIs - lookup (`/api/metadata/:id` with replica details)
+- [x] 3.4 Storage Node internal APIs - chunk store, stream, verify, delete, heartbeat
+- [x] 3.5 Monitoring APIs - cluster status (`/api/cluster/status`), node list with metrics (`/api/cluster/nodes`), system audit logs (`/api/logs`)
 
 ### Phase 4: Frontend Dashboard
 - [ ] 4.1 Login/Register Pages - High-performance dark obsidian auth console with demo credentials, role toggle (USER/ADMIN), form validation, and JWT persistence
