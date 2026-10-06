@@ -183,13 +183,13 @@ type ObjectMetadataWithReplicas struct {
 
 // ReplicaLocation provides storage node address information for a replica
 type ReplicaLocation struct {
-	ReplicaID    uuid.UUID     `json:"replica_id"`
-	NodeID       uuid.UUID     `json:"node_id"`
-	Hostname     string        `json:"hostname"`
-	IPAddress    string        `json:"ip_address"`
-	Status       ReplicaStatus `json:"status"`
-	NodeStatus   NodeStatus    `json:"node_status"`
-	InternalURL  string        `json:"internal_url"`
+	ReplicaID   uuid.UUID     `json:"replica_id"`
+	NodeID      uuid.UUID     `json:"node_id"`
+	Hostname    string        `json:"hostname"`
+	IPAddress   string        `json:"ip_address"`
+	Status      ReplicaStatus `json:"status"`
+	NodeStatus  NodeStatus    `json:"node_status"`
+	InternalURL string        `json:"internal_url"`
 }
 
 // RegisterRequest represents the payload required to register a new user
