@@ -201,7 +201,6 @@ func (h *ObjectDownloadHandler) Download(c *gin.Context) {
 
 	// 3. Automatic failover loop across healthy replicas
 	var bodyStream io.ReadCloser
-	var streamLen int64
 	var activeNode types.StorageNode
 
 	for _, rep := range replicas {
@@ -217,10 +216,9 @@ func (h *ObjectDownloadHandler) Download(c *gin.Context) {
 			continue
 		}
 
-		stream, length, err := h.storageClient.FetchChunk(c.Request.Context(), *node, objectID)
+		stream, _, err := h.storageClient.FetchChunk(c.Request.Context(), *node, objectID)
 		if err == nil {
 			bodyStream = stream
-			streamLen = length
 			activeNode = *node
 			break
 		}
@@ -291,14 +289,13 @@ func (h *ObjectDownloadHandler) Download(c *gin.Context) {
 		}
 	}()
 
-	// 6. Serve download to client
+	// 6. Serve download to client.
+	// Content-Length is set from len(data): we always buffer the full body
+	// via io.ReadAll, so this is the only correct length after decompression.
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", obj.ObjectName))
 	c.Header("Content-Type", obj.MimeType)
 	c.Header("Content-Length", strconv.FormatInt(int64(len(data)), 10))
 	c.Header("X-Checksum-SHA256", obj.Checksum)
-	if streamLen > 0 {
-		c.Header("Content-Length", strconv.FormatInt(streamLen, 10))
-	}
 	c.Data(http.StatusOK, obj.MimeType, data)
 }
 

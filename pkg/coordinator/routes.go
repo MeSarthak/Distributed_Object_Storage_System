@@ -56,20 +56,22 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 
 	// -------------------------------------------------------------------------
 	// 3.2 Object APIs (Protected with JWT)
+	// /search must be registered before /:id — httprouter panics if a static
+	// segment follows a wildcard under the same prefix.
 	// -------------------------------------------------------------------------
 	objects := router.Group("/api/objects", authMiddleware)
 	{
 		objects.POST("", uploadHandler.Upload)
-		objects.GET("/:id", downloadHandler.Download)
-		objects.DELETE("/:id", deleteHandler.Delete)
 		objects.GET("", downloadHandler.List)
 		objects.GET("/search", downloadHandler.Search)
+		objects.GET("/:id", downloadHandler.Download)
+		objects.DELETE("/:id", deleteHandler.Delete)
 	}
 
 	// -------------------------------------------------------------------------
 	// 3.3 Metadata APIs (Protected with JWT)
+	// One handler per route. MetadataHandler owns this endpoint.
 	// -------------------------------------------------------------------------
-	router.GET("/api/metadata/:id", authMiddleware, monitoringHandler.Metadata)
 	router.GET("/api/metadata/:id", authMiddleware, metadataHandler.GetObjectMetadata)
 	
 	// -------------------------------------------------------------------------
