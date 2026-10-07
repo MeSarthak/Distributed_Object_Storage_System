@@ -220,7 +220,7 @@ func (h *ObjectUploadHandler) Upload(c *gin.Context) {
 	}
 
 	for _, node := range successfulNodes {
-		if _, err := h.replicaRepo.InsertReplicaTx(tx, objectID, node.NodeID); err != nil {
+		if _, err := h.replicaRepo.InsertHealthyReplicaTx(tx, objectID, node.NodeID); err != nil {
 			cleanupChunks()
 			c.JSON(http.StatusInternalServerError, types.StandardResponse{
 				Success:   false,
