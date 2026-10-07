@@ -80,10 +80,9 @@ func RegisterAPIRoutes(router *gin.Engine, deps *APIDependencies) {
 	cluster := router.Group("/api/cluster", authMiddleware)
 	{
 		// Cluster status is visible to all authenticated users
-		// cluster.GET("/status", monitoringHandler.ClusterStatus)
+		cluster.GET("/status", monitoringHandler.ClusterStatus)
 		
-		// Both cluster endpoints require ADMIN role per spec
-		cluster.GET("/status", adminMiddleware, monitoringHandler.ClusterStatus)
+		// Detailed nodes list requires ADMIN role
 		cluster.GET("/nodes", adminMiddleware, monitoringHandler.ClusterNodes)
 	}
 

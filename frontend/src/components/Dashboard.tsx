@@ -75,9 +75,39 @@ export default function Dashboard() {
       
       <div className="bg-obsidian-light border border-gray-800 rounded-2xl p-6">
         <h2 className="text-xl font-semibold mb-4">Tier Breakdown</h2>
-        {/* Placeholder for chart */}
-        <div className="h-64 flex items-center justify-center border border-gray-800 border-dashed rounded-xl">
-          <p className="text-gray-500">Tier visualization loading...</p>
+        <div className="flex flex-col space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <div className="w-3 h-3 rounded-full bg-red-500"></div>
+              <span className="text-gray-300">Hot Tier (Active, 5x Replication)</span>
+            </div>
+            <span className="font-semibold">{stats?.tier_hot || 0} objects</span>
+          </div>
+          <div className="w-full bg-obsidian rounded-full h-2">
+            <div className="bg-red-500 h-2 rounded-full" style={{ width: `${Math.max(2, ((stats?.tier_hot || 0) / Math.max(1, (stats?.total_objects || 1))) * 100)}%` }}></div>
+          </div>
+
+          <div className="flex items-center justify-between mt-4">
+            <div className="flex items-center space-x-2">
+              <div className="w-3 h-3 rounded-full bg-amber-500"></div>
+              <span className="text-gray-300">Warm Tier (Standard, 3x Replication)</span>
+            </div>
+            <span className="font-semibold">{stats?.tier_warm || 0} objects</span>
+          </div>
+          <div className="w-full bg-obsidian rounded-full h-2">
+            <div className="bg-amber-500 h-2 rounded-full" style={{ width: `${Math.max(2, ((stats?.tier_warm || 0) / Math.max(1, (stats?.total_objects || 1))) * 100)}%` }}></div>
+          </div>
+
+          <div className="flex items-center justify-between mt-4">
+            <div className="flex items-center space-x-2">
+              <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+              <span className="text-gray-300">Cold Tier (Archive, 2x Replication)</span>
+            </div>
+            <span className="font-semibold">{stats?.tier_cold || 0} objects</span>
+          </div>
+          <div className="w-full bg-obsidian rounded-full h-2">
+            <div className="bg-blue-500 h-2 rounded-full" style={{ width: `${Math.max(2, ((stats?.tier_cold || 0) / Math.max(1, (stats?.total_objects || 1))) * 100)}%` }}></div>
+          </div>
         </div>
       </div>
     </div>

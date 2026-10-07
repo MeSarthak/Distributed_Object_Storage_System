@@ -15,7 +15,11 @@ export default function ObjectExplorer() {
   const fetchObjects = async () => {
     try {
       const res = await api.get('/objects');
-      setObjects(res.data.data.objects || []);
+      const objectsWithTier = (res.data.data.objects || []).map((o: any) => ({
+        ...o,
+        tier: o.replication_factor >= 5 ? 'HOT' : o.replication_factor <= 2 ? 'COLD' : 'WARM'
+      }));
+      setObjects(objectsWithTier);
     } catch (err) {
       console.error('Failed to fetch objects', err);
     }

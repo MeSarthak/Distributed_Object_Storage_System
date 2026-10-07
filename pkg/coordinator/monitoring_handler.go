@@ -95,6 +95,11 @@ func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
 	var totalObjects int64
 	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects").Scan(&totalObjects)
 
+	var hot, warm, cold int
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects WHERE replication_factor >= 5").Scan(&hot)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects WHERE replication_factor >= 3 AND replication_factor <= 4").Scan(&warm)
+	_ = h.db.QueryRow("SELECT COUNT(*) FROM objects WHERE replication_factor <= 2").Scan(&cold)
+
 	clusterHealth := "HEALTHY"
 	if degradedNodes > 0 || offlineNodes > 0 {
 		clusterHealth = "DEGRADED"
@@ -119,6 +124,9 @@ func (h *MonitoringHandler) ClusterStatus(c *gin.Context) {
 			"avg_memory_percent":   fmt.Sprintf("%.2f", avgMemory),
 			"avg_latency_ms":       fmt.Sprintf("%.2f", avgLatency),
 			"total_objects":        totalObjects,
+			"tier_hot":             hot,
+			"tier_warm":            warm,
+			"tier_cold":            cold,
 			"timestamp":            time.Now().UTC(),
 		},
 	})
