@@ -100,11 +100,11 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [x] 3.5 Monitoring APIs - cluster status (`/api/cluster/status`), node list with metrics (`/api/cluster/nodes`), system audit logs (`/api/logs`)
 
 ### Phase 4: Frontend Dashboard
-- [ ] 4.1 Login/Register Pages - High-performance dark obsidian auth console with demo credentials, role toggle (USER/ADMIN), form validation, and JWT persistence
-- [ ] 4.2 User Dashboard - Live telemetry overview (stored objects, physical capacity, online node fleet, tier breakdown, and quick upload)
-- [ ] 4.3 Object Explorer - Searchable object manager with access tier filters (HOT/WARM/COLD), sortable table & card grid views, SHA-256 copy helpers, streaming download, and cascade purge
-- [ ] 4.4 Upload Interface - Drag-and-drop file selector, browser-native Web Crypto SHA-256 pre-calculation, upload progress bar, and multi-node placement visualizer
-- [ ] 4.5 Admin Dashboard - Real-time cluster hardware metrics (CPU, RAM, storage disk utilization, latency, and heartbeat ages) with live system audit logs and mathematical placement formula inspector
+- [x] 4.1 Login/Register Pages - High-performance dark obsidian auth console with demo credentials, role toggle (USER/ADMIN), form validation, and JWT persistence
+- [x] 4.2 User Dashboard - Live telemetry overview (stored objects, physical capacity, online node fleet, tier breakdown, and quick upload)
+- [x] 4.3 Object Explorer - Searchable object manager with access tier filters (HOT/WARM/COLD), sortable table & card grid views, SHA-256 copy helpers, streaming download, and cascade purge
+- [x] 4.4 Upload Interface - Drag-and-drop file selector, browser-native Web Crypto SHA-256 pre-calculation, upload progress bar, and multi-node placement visualizer
+- [x] 4.5 Admin Dashboard - Real-time cluster hardware metrics (CPU, RAM, storage disk utilization, latency, and heartbeat ages) with live system audit logs and mathematical placement formula inspector
 
 ### Phase 5: Fault Scenarios & Testing
 - [ ] 5.1 Storage Node Failure - kill container → self-healing
@@ -219,16 +219,16 @@ Building a **Distributed Object Storage System with Intelligent Data Placement a
 - [ ] Error codes: AUTH_401, AUTH_403, OBJ_404, NODE_503, META_500, REPL_500
 
 ### Frontend Requirements
-- [ ] Login Page: email, password, login, register link
-- [ ] User Dashboard: total objects, storage used, recent uploads, upload/download/delete
-- [ ] Object Explorer: object name, size, upload date, replication factor, storage status, download, delete
-- [ ] Upload Interface: file selector, progress bar, status notifications, cancel upload
-- [ ] Admin Dashboard: cluster capacity, used/free capacity, online/offline nodes, CPU/RAM/storage, object stats, placement decisions, replica distribution, heartbeats, failures, self-healing events, system logs
+- [x] Login Page: email, password, login, register link
+- [x] User Dashboard: total objects, storage used, recent uploads, upload/download/delete
+- [x] Object Explorer: object name, size, upload date, replication factor, storage status, download, delete
+- [x] Upload Interface: file selector, progress bar, status notifications, cancel upload
+- [x] Admin Dashboard: cluster capacity, used/free capacity, online/offline nodes, CPU/RAM/storage, object stats, placement decisions, replica distribution, heartbeats, failures, self-healing events, system logs
 
 ### Monitoring & Observability
-- [ ] Log all important events: login, upload, download, delete, node registration/leaving, heartbeat failure, replica creation/deletion, placement decisions, self-healing operations, errors
-- [ ] Each log: timestamp, user_id, object_id, node_id, operation_type, status, error_message
-- [ ] Admin dashboard exposes these logs
+- [x] Log all important events: login, upload, download, delete, node registration/leaving, heartbeat failure, replica creation/deletion, placement decisions, self-healing operations, errors
+- [x] Each log: timestamp, user_id, object_id, node_id, operation_type, status, error_message
+- [x] Admin dashboard exposes these logs
 
 ### Performance Targets
 - [ ] Login ≤ 2 seconds
